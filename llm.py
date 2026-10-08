@@ -1,6 +1,8 @@
 import json
 import os
 
+import streamlit as st
+
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -8,42 +10,37 @@ from groq import Groq
 from tools.registry import execute_tool
 
 
-# ============================================================
-# ENVIRONMENT
-# ============================================================
-
+# Local development
 load_dotenv()
 
 
-GROQ_API_KEY = os.getenv(
-    "GROQ_API_KEY"
-)
+# First try local .env
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+
+# If running on Streamlit Cloud,
+# try Streamlit Secrets
+if not GROQ_API_KEY:
+    try:
+        GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+    except Exception:
+        GROQ_API_KEY = None
 
 
 if not GROQ_API_KEY:
-
     raise ValueError(
-        "GROQ_API_KEY was not found. "
-        "Add GROQ_API_KEY to your .env file."
+        "GROQ_API_KEY is not configured. "
+        "For local development add it to .env. "
+        "For Streamlit Cloud add it to App Secrets."
     )
 
-
-# ============================================================
-# GROQ CLIENT
-# ============================================================
 
 client = Groq(
     api_key=GROQ_API_KEY
 )
 
 
-# ============================================================
-# MODEL
-# ============================================================
-
 MODEL_NAME = "qwen/qwen3.8-27b"
-
-
 # ============================================================
 # SYSTEM PROMPT
 # ============================================================

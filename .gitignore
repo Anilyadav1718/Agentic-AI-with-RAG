@@ -3,7 +3,7 @@
 .env.*
 !.env.example
 
-# Virtual environment
+# Python environments
 .venv/
 venv/
 
@@ -11,9 +11,19 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 
-# Chroma vector database
+# Nexor AI SQLite
+nexor_ai.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Chroma
 chroma_db/
+
+# Streamlit secrets
+.streamlit/secrets.toml
 
 # IDE
 .vscode/

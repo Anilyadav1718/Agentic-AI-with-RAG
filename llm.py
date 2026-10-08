@@ -1,63 +1,57 @@
 import json
 import os
+import re
+from urllib.parse import urlparse
 
 import streamlit as st
-
 from dotenv import load_dotenv
 from groq import Groq
 
 # pyrefly: ignore [missing-import]
 from tools.registry import execute_tool
-from rag.document_rag import get_active_document
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-MODEL_NAME = "qwen/qwen3.8-27b"
+APP_NAME = "Nexor AI"
 
-# Keep this low because the current Groq tier/model
-# has a small output-tokens-per-minute limit.
-MAX_OUTPUT_TOKENS = 300
+MODEL_NAME = "openai/gpt-oss-120b"
 
-# Maximum number of agent/tool steps for one request.
-MAX_STEPS = 5
+MAX_AGENT_STEPS = 5
+
+# Higher ceiling so technical/tutorial responses can finish.
+# This is a maximum, not a guaranteed usage amount.
+MAX_OUTPUT_TOKENS = 3000
+
+MAX_WEB_RESULTS = 3
+
+# Low reasoning leaves more room for the visible answer.
+DEFAULT_REASONING_EFFORT = "low"
+RAG_REASONING_EFFORT = "low"
 
 
 # ============================================================
 # API KEY
 # ============================================================
 
-# Local development:
-# Load variables from .env if the file exists.
 load_dotenv()
 
-GROQ_API_KEY = os.getenv(
-    "GROQ_API_KEY"
-)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-
-# Streamlit Community Cloud:
-# If .env/environment variable is unavailable,
-# try Streamlit App Secrets.
 if not GROQ_API_KEY:
-
     try:
-        GROQ_API_KEY = st.secrets[
-            "GROQ_API_KEY"
-        ]
-
+        GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
     except Exception:
         GROQ_API_KEY = None
 
 
 if not GROQ_API_KEY:
-
     raise ValueError(
-        "GROQ_API_KEY is not configured. "
-        "Add it to .env for local development "
-        "or Streamlit App Secrets for deployment."
+        "GROQ_API_KEY is missing. "
+        "Add it to .env locally or Streamlit Secrets "
+        "when deployed."
     )
 
 
@@ -71,645 +65,678 @@ client = Groq(
 
 
 # ============================================================
-# TOOL DEFINITIONS
+# WEB SEARCH TOOL
+# IMPORTANT:
+# max_results is NOT exposed to the model.
+# Python controls it.
 # ============================================================
 
-TOOL_DEFINITIONS = [
-
-    # --------------------------------------------------------
-    # CALCULATOR
-    # --------------------------------------------------------
-
-    {
-        "type": "function",
-        "function": {
-            "name": "calculator",
-            "description": (
-                "Perform basic arithmetic calculations. "
-                "Use this tool when the user asks to add, "
-                "subtract, multiply, or divide numbers."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-
-                    "a": {
-                        "type": "number",
-                        "description": "First number."
-                    },
-
-                    "b": {
-                        "type": "number",
-                        "description": "Second number."
-                    },
-
-                    "operation": {
-                        "type": "string",
-                        "enum": [
-                            "add",
-                            "subtract",
-                            "multiply",
-                            "divide"
-                        ],
-                        "description": (
-                            "Arithmetic operation."
-                        )
-                    }
-
-                },
-                "required": [
-                    "a",
-                    "b",
-                    "operation"
-                ],
-                "additionalProperties": False
-            }
-        }
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the public web for current, latest, "
+            "recent, live, news, or time-sensitive information."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "A concise and specific web search query."
+                    ),
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
     },
+}
 
 
-    # --------------------------------------------------------
-    # WEB SEARCH
-    # --------------------------------------------------------
-
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": (
-                "Search the public web for current or "
-                "recent information. Use this tool for "
-                "questions involving latest, today, "
-                "current, recent, live, news, prices, "
-                "events, or information that may have "
-                "changed after the model's training."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "A concise web search query."
-                        )
-                    },
-
-                    "max_results": {
-                        "type": "integer",
-                        "description": (
-                            "Number of search results. "
-                            "Use 3 or fewer."
-                        ),
-                        "minimum": 1,
-                        "maximum": 3
-                    }
-
-                },
-                "required": [
-                    "query"
-                ],
-                "additionalProperties": False
-            }
-        }
-    },
-
-
-    # --------------------------------------------------------
-    # KNOWLEDGE BASE / RAG
-    # --------------------------------------------------------
-
-    {
-        "type": "function",
-        "function": {
-            "name": "knowledge_base_search",
-            "description": (
-                "Search the currently uploaded PDF "
-                "knowledge base using hybrid retrieval. "
-                "Use this tool when the user explicitly "
-                "asks about their uploaded PDF, uploaded "
-                "document, uploaded file, knowledge base, "
-                "or asks what their document says."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "The question or search query "
-                            "for the uploaded document."
-                        )
-                    }
-
-                },
-                "required": [
-                    "query"
-                ],
-                "additionalProperties": False
-            }
-        }
-    }
-
+ASSISTANT_TOOLS = [
+    WEB_SEARCH_TOOL
 ]
 
 
 # ============================================================
-# SYSTEM PROMPT
+# ASSISTANT SYSTEM PROMPT
 # ============================================================
 
-SYSTEM_PROMPT = """
-You are Nexora AI, an Agentic AI assistant with tool-calling
-and retrieval-augmented generation capabilities.
+ASSISTANT_SYSTEM_PROMPT = """
+You are Nexor AI, an advanced Agentic AI assistant.
 
-You have access to three tools:
+You can use a web_search tool.
 
-1. calculator
-2. web_search
-3. knowledge_base_search
+GENERAL KNOWLEDGE
 
+Answer stable general knowledge, programming, Python,
+AI, machine learning, software engineering, RAG,
+Agentic AI, career, interview, educational and
+conceptual questions directly.
 
-TOOL ROUTING RULES
+WEB SEARCH
 
-Use calculator when:
-- The user asks for arithmetic.
-- The user asks you to calculate numbers.
+Use web_search when the user asks for information that is:
 
-Use web_search when:
-- The user asks for latest information.
-- The user says "today".
-- The user says "current".
-- The user says "recent".
-- The user asks for news.
-- The user asks for live information.
-- The answer depends on information that may have changed.
+- current
+- latest
+- today
+- recent
+- live
+- news-related
+- time-sensitive
+- likely to have changed recently
 
-Use knowledge_base_search when:
-- The user explicitly mentions their uploaded PDF.
-- The user says "my PDF".
-- The user says "uploaded PDF".
-- The user says "uploaded document".
-- The user says "uploaded file".
-- The user says "knowledge base".
-- The user asks "according to my document".
-- The user asks what information exists inside the uploaded document.
+Use one concise and specific search query.
 
-Do NOT use knowledge_base_search merely because a PDF happens
-to be uploaded.
+Search only once when one successful search gives enough
+information.
 
-For general knowledge questions that do not require current
-information, answer directly without using a tool.
+After receiving web results, synthesize those results
+into the final answer.
 
+Do not repeatedly search for slightly different versions
+of the same query.
 
-RAG RULES
+CURRENT INFORMATION SAFETY
 
-When knowledge_base_search returns multiple sources:
+Never describe information as current, latest, recent,
+today, or "as of" the current date unless web_search
+was actually executed.
 
-- Read all returned sources.
-- Synthesize the evidence into one answer.
-- Do not simply list or copy the retrieved chunks.
-- Do not reproduce entire chunks.
-- Use the retrieved information as the basis for the answer.
+Never invent recent developments.
 
-The retrieval system may provide:
-- hybrid relevance
-- semantic relevance
-- BM25 scores
-- match type
+OUTPUT FORMATTING
 
-These values are retrieval ranking signals.
-They are NOT probabilities and are NOT calibrated confidence scores.
+Use clean Markdown.
 
-The backend controls how many RAG chunks are retrieved.
-Do not attempt to choose top_k.
+Do not output raw HTML formatting such as:
 
-If the user makes an obvious typo such as:
-"reag", "ragg", or similar,
-and the document context clearly indicates they mean "RAG",
-interpret the intended term appropriately.
+<br>
+<br/>
+<p>
+</p>
+<div>
+</div>
 
+Use normal Markdown paragraphs, headings, lists,
+tables and fenced code blocks.
 
-WEB SEARCH RULES
+PROGRAMMING ANSWERS
 
-When using web_search:
+When generating code:
 
-- Use a concise search query.
-- Request at most 3 results.
-- Summarize the useful information.
-- Do not reproduce entire search snippets.
-- Do not unnecessarily repeat the same web search.
-- Prefer one search unless another search is genuinely required.
+- Use fenced Markdown code blocks.
+- Specify the programming language.
+- Generate syntactically complete code.
+- Never intentionally stop in the middle of a function.
+- Never intentionally stop in the middle of a code block.
+- Do not use HTML line-break tags.
+- Explain important code when useful.
 
+ANSWER QUALITY
 
-RESPONSE STYLE
+Give clear, complete and technically correct answers.
 
-Keep responses concise and useful.
+For simple questions, be concise.
 
-For ordinary questions:
-- Prefer a short direct answer.
+For complex technical questions, provide enough detail
+to properly answer the request.
 
-For web-search questions:
-- Summarize the important findings.
-- Prefer approximately 200 words or fewer unless the user
-  explicitly requests more detail.
+Prefer a complete focused answer over unnecessary verbosity.
 
-For document questions:
-- Synthesize the retrieved evidence.
-- Do not repeat full retrieved chunks.
+Never intentionally stop in the middle of:
 
-Do not claim that a tool was used unless it was actually used.
+- a sentence
+- a function
+- a code block
+- a numbered explanation
+- a Markdown section
+
+BROAD EDUCATIONAL REQUESTS
+
+If the user asks for an extremely broad subject such as
+"teach me Python completely", "teach me AI", or another
+topic that would require a very large response:
+
+1. Give a clear learning roadmap.
+2. Teach a useful and complete first section.
+3. Finish all examples and code blocks.
+4. Clearly identify what should be learned next.
+5. Do not attempt to squeeze an entire textbook into one answer.
+
+It is better to provide one complete lesson than several
+incomplete lessons.
 """
 
 
 # ============================================================
-# BUILD CHAT HISTORY
+# RAG SYSTEM PROMPT
 # ============================================================
 
-def build_messages(
-    chat_history,
-    active_document=None
-):
+RAG_SYSTEM_PROMPT = """
+You are Nexor AI operating in Document RAG mode.
+
+Answer ONLY using the supplied retrieved document context.
+
+RULES
+
+1. Use only the supplied document context.
+
+2. Do not use web information.
+
+3. Do not use general model knowledge to fill missing facts.
+
+4. If the retrieved document context does not contain enough
+   information, clearly state that the answer could not be
+   found in the uploaded document.
+
+5. Synthesize multiple retrieved chunks when useful.
+
+6. Do not simply dump the retrieved chunks.
+
+7. Mention document page numbers when useful.
+
+8. Retrieval scores are ranking and evidence signals.
+   They are not probabilities of correctness.
+
+OUTPUT FORMATTING
+
+Use clean Markdown.
+
+Do not output raw HTML tags such as:
+
+<br>
+<p>
+<div>
+
+Use fenced Markdown code blocks for code.
+
+Never intentionally stop in the middle of a sentence,
+function, code block, list or section.
+
+For broad questions about the document, provide a focused
+summary rather than unnecessarily reproducing the entire
+document.
+"""
+
+
+# ============================================================
+# CLEAN MODEL OUTPUT
+# ============================================================
+
+def clean_model_output(content: str) -> str:
     """
-    Convert Streamlit chat history into Groq messages.
-
-    Historical tool metadata is converted into plain text so
-    the model can answer follow-up questions such as:
-    "Which tool did you use?"
-
-    active_document may be passed by app.py.
-    If app.py does not pass it, fall back to the RAG module.
+    Convert common unwanted HTML formatting to clean Markdown.
     """
 
-    messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT
-        }
-    ]
+    if not content:
+        return ""
 
+    # <br>, <br/>, <br />
+    content = re.sub(
+        r"<br\s*/?>",
+        "\n",
+        content,
+        flags=re.IGNORECASE,
+    )
 
-    # --------------------------------------------------------
-    # ACTIVE DOCUMENT STATUS
-    # --------------------------------------------------------
+    # Paragraph tags
+    content = re.sub(
+        r"</?p[^>]*>",
+        "",
+        content,
+        flags=re.IGNORECASE,
+    )
 
-    if not active_document:
+    # Div tags
+    content = re.sub(
+        r"</?div[^>]*>",
+        "",
+        content,
+        flags=re.IGNORECASE,
+    )
 
-        try:
-            active_document = (
-                get_active_document()
-            )
+    # Excessive blank lines
+    content = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        content,
+    )
 
-        except Exception:
-            active_document = None
-
-
-    if active_document:
-
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "A PDF knowledge base is currently "
-                    f"active: {active_document}. "
-                    "Do not search it unless the user's "
-                    "request explicitly refers to the "
-                    "uploaded document or knowledge base."
-                )
-            }
-        )
-
-    else:
-
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "There is currently no active "
-                    "uploaded PDF knowledge base."
-                )
-            }
-        )
-
-
-    # --------------------------------------------------------
-    # CONVERSATION HISTORY
-    # --------------------------------------------------------
-
-    for message in chat_history:
-
-        role = message.get(
-            "role"
-        )
-
-        content = message.get(
-            "content",
-            ""
-        )
-
-
-        if role not in [
-            "user",
-            "assistant"
-        ]:
-            continue
-
-
-        # ----------------------------------------------------
-        # USER MESSAGE
-        # ----------------------------------------------------
-
-        if role == "user":
-
-            messages.append(
-                {
-                    "role": "user",
-                    "content": content
-                }
-            )
-
-            continue
-
-
-        # ----------------------------------------------------
-        # ASSISTANT MESSAGE
-        # ----------------------------------------------------
-
-        assistant_content = (
-            content
-            if content
-            else ""
-        )
-
-
-        # ----------------------------------------------------
-        # HISTORICAL TOOL METADATA
-        # ----------------------------------------------------
-
-        tools_used = message.get(
-            "tools",
-            []
-        )
-
-
-        if tools_used:
-
-            tool_history = [
-                "",
-                "[TOOLS USED FOR THIS RESPONSE]"
-            ]
-
-
-            for tool_event in tools_used:
-
-                tool_name = tool_event.get(
-                    "name",
-                    "unknown"
-                )
-
-                arguments = tool_event.get(
-                    "arguments",
-                    {}
-                )
-
-
-                tool_history.append(
-                    f"- Tool: {tool_name}"
-                )
-
-                tool_history.append(
-                    "  Arguments: "
-                    + json.dumps(
-                        arguments,
-                        ensure_ascii=False
-                    )
-                )
-
-
-            assistant_content += (
-                "\n"
-                + "\n".join(
-                    tool_history
-                )
-            )
-
-
-        messages.append(
-            {
-                "role": "assistant",
-                "content": assistant_content
-            }
-        )
-
-
-    return messages
+    return content.strip()
 
 
 # ============================================================
 # PARSE TOOL ARGUMENTS
 # ============================================================
 
-def parse_tool_arguments(
-    raw_arguments
-):
-    """
-    Convert Groq's JSON argument string into a Python dict.
-    """
-
+def parse_tool_arguments(raw_arguments):
     if not raw_arguments:
         return {}
 
-
-    if isinstance(
-        raw_arguments,
-        dict
-    ):
+    if isinstance(raw_arguments, dict):
         return raw_arguments
 
-
     try:
+        parsed = json.loads(raw_arguments)
 
-        parsed = json.loads(
-            raw_arguments
-        )
-
-
-        if isinstance(
-            parsed,
-            dict
-        ):
+        if isinstance(parsed, dict):
             return parsed
 
-
-        return {}
-
-
     except Exception:
+        pass
 
-        return {}
-
-
-# ============================================================
-# EXTRACT RAG SOURCES
-# ============================================================
-
-def extract_sources(
-    tool_name,
-    tool_result
-):
-    """
-    Extract source metadata from the RAG tool so app.py can
-    display the retrieved PDF chunks.
-    """
-
-    if tool_name != "knowledge_base_search":
-        return []
-
-
-    if not isinstance(
-        tool_result,
-        dict
-    ):
-        return []
-
-
-    if not tool_result.get(
-        "success"
-    ):
-        return []
-
-
-    return tool_result.get(
-        "sources",
-        []
-    ) or []
+    return {}
 
 
 # ============================================================
-# ASK LLM
+# WEB EVIDENCE SCORE
 # ============================================================
 
-def ask_llm(
-    chat_history,
-    active_document=None
-):
+def calculate_web_evidence_score(tool_events):
     """
-    Run the Agentic AI loop.
+    Heuristic retrieval score.
 
-    Flow:
-
-    User
-      ↓
-    Groq
-      ↓
-    Tool call?
-      ├── Yes → execute tool → return result → Groq
-      └── No  → final answer
-
-    active_document is accepted so this function is compatible
-    with the existing app.py.
-
-    max_tokens is intentionally kept low because the current
-    Groq tier/model has a small output-tokens-per-minute quota.
+    IMPORTANT:
+    This is NOT model confidence and NOT a probability
+    that the answer is correct.
     """
 
+    web_results = []
 
-    # ========================================================
-    # BUILD MESSAGES
-    # ========================================================
+    for event in tool_events:
 
-    messages = build_messages(
-        chat_history,
-        active_document=active_document
+        if event.get("name") != "web_search":
+            continue
+
+        result = event.get("result", {})
+
+        if not result.get("success", False):
+            continue
+
+        web_results.extend(
+            result.get("results", []) or []
+        )
+
+    if not web_results:
+        return None
+
+    usable_results = [
+        result
+        for result in web_results
+        if result.get("title") and result.get("url")
+    ]
+
+    if not usable_results:
+        return None
+
+    domains = set()
+
+    for result in usable_results:
+
+        url = result.get("url", "")
+
+        if not url:
+            continue
+
+        try:
+            domain = (
+                urlparse(url)
+                .netloc
+                .lower()
+            )
+
+            if domain.startswith("www."):
+                domain = domain[4:]
+
+            if domain:
+                domains.add(domain)
+
+        except Exception:
+            pass
+
+    # Up to 45 points for usable result count
+    quantity_score = min(
+        len(usable_results) / MAX_WEB_RESULTS,
+        1.0,
+    ) * 45
+
+    # Up to 35 points for domain diversity
+    diversity_score = min(
+        len(domains) / MAX_WEB_RESULTS,
+        1.0,
+    ) * 35
+
+    # Successful retrieval
+    success_score = 20
+
+    score = (
+        quantity_score
+        + diversity_score
+        + success_score
+    )
+
+    return round(
+        min(score, 100),
+        1,
     )
 
 
+# ============================================================
+# RAG EVIDENCE SCORE
+# ============================================================
+
+def calculate_rag_evidence_score(sources):
+    """
+    Hybrid retrieval evidence heuristic.
+
+    Not a probability of correctness.
+    """
+
+    if not sources:
+        return None
+
+    relevance_scores = [
+        float(
+            source.get(
+                "relevance",
+                0,
+            )
+        )
+        for source in sources
+    ]
+
+    semantic_scores = [
+        float(
+            source.get(
+                "semantic_relevance",
+                0,
+            )
+        )
+        for source in sources
+    ]
+
+    relevance_average = (
+        sum(relevance_scores)
+        / len(relevance_scores)
+    )
+
+    semantic_average = (
+        sum(semantic_scores)
+        / len(semantic_scores)
+    )
+
+    both_count = sum(
+        1
+        for source in sources
+        if source.get("match_type")
+        == "Semantic + Keyword"
+    )
+
+    fusion_bonus = (
+        both_count
+        / len(sources)
+    ) * 10
+
+    score = (
+        relevance_average * 0.50
+        + semantic_average * 0.40
+        + fusion_bonus
+    )
+
+    return round(
+        max(
+            0,
+            min(score, 100),
+        ),
+        1,
+    )
+
+
+# ============================================================
+# BUILD CHAT HISTORY
+# ============================================================
+
+def build_assistant_messages(chat_history):
+    messages = [
+        {
+            "role": "system",
+            "content": ASSISTANT_SYSTEM_PROMPT,
+        }
+    ]
+
+    # SQLite stores the complete history.
+    # Only the latest messages are sent to the model.
+    # This helps reduce input-token usage.
+    recent_history = chat_history[-12:]
+
+    for message in recent_history:
+
+        role = message.get("role")
+
+        if role not in {
+            "user",
+            "assistant",
+        }:
+            continue
+
+        content = message.get(
+            "content",
+            "",
+        )
+
+        if not content:
+            continue
+
+        messages.append(
+            {
+                "role": role,
+                "content": content,
+            }
+        )
+
+    return messages
+
+
+# ============================================================
+# AGENT METRICS
+# ============================================================
+
+def build_agent_metrics(
+    tool_events,
+    steps_used,
+    truncated=False,
+):
+    resources_used = 0
+
+    for event in tool_events:
+
+        result = event.get(
+            "result",
+            {},
+        )
+
+        resources_used += len(
+            result.get(
+                "results",
+                [],
+            )
+            or []
+        )
+
+    return {
+        "steps_used": steps_used,
+        "max_steps": MAX_AGENT_STEPS,
+        "tools_used": len(tool_events),
+        "resources_used": resources_used,
+        "evidence_score": (
+            calculate_web_evidence_score(
+                tool_events
+            )
+        ),
+        "truncated": truncated,
+    }
+
+
+# ============================================================
+# RATE LIMIT CHECK
+# ============================================================
+
+def is_rate_limit_error(error_text: str) -> bool:
+    lowered = error_text.lower()
+
+    return (
+        "429" in error_text
+        or "rate_limit" in lowered
+        or "ratelimit" in lowered
+        or "rate limit" in lowered
+    )
+
+
+# ============================================================
+# TRUNCATION MESSAGE
+# ============================================================
+
+def add_truncation_notice(
+    answer: str,
+    truncated: bool,
+) -> str:
+
+    if not truncated:
+        return answer
+
+    return (
+        answer
+        + "\n\n---\n\n"
+        + "⚠️ **This response reached the output-token "
+          "limit.** Send **continue** and Nexor AI can "
+          "continue from this point."
+    )
+
+
+# ============================================================
+# AI ASSISTANT
+# ============================================================
+
+def ask_assistant(chat_history):
+    messages = build_assistant_messages(
+        chat_history
+    )
+
     tool_events = []
 
-    all_sources = []
+    used_tools = set()
 
-
-    # ========================================================
-    # AGENT LOOP
-    # ========================================================
+    steps_used = 0
 
     for step in range(
         1,
-        MAX_STEPS + 1
+        MAX_AGENT_STEPS + 1,
     ):
 
-        print(
-            "\n"
-            "===================================="
-        )
+        steps_used = step
 
-        print(
-            f"🤖 AGENT STEP: {step}"
-        )
+        # ====================================================
+        # FIRST / NORMAL MODEL CALL
+        # ====================================================
 
-        print(
-            "===================================="
-        )
-
-
-        # ----------------------------------------------------
-        # CALL GROQ
-        # ----------------------------------------------------
-
-        response = (
-            client
-            .chat
-            .completions
-            .create(
-                model=MODEL_NAME,
-                messages=messages,
-                tools=TOOL_DEFINITIONS,
-                tool_choice="auto",
-                temperature=0.2,
-                max_tokens=MAX_OUTPUT_TOKENS
+        try:
+            response = (
+                client.chat
+                .completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    tools=ASSISTANT_TOOLS,
+                    tool_choice="auto",
+                    reasoning_effort=(
+                        DEFAULT_REASONING_EFFORT
+                    ),
+                    reasoning_format="hidden",
+                    temperature=0.3,
+                    max_completion_tokens=(
+                        MAX_OUTPUT_TOKENS
+                    ),
+                )
             )
-        )
 
+        except Exception as error:
 
-        assistant_message = (
-            response
-            .choices[0]
-            .message
-        )
+            error_text = str(error)
 
+            if is_rate_limit_error(
+                error_text
+            ):
+                return {
+                    "content": (
+                        "Groq rate limit reached. "
+                        "Please wait briefly and try again."
+                    ),
+                    "tools": tool_events,
+                    "metrics": build_agent_metrics(
+                        tool_events,
+                        steps_used,
+                    ),
+                }
+
+            return {
+                "content": (
+                    "The AI service returned an error:\n\n"
+                    f"`{error_text}`"
+                ),
+                "tools": tool_events,
+                "metrics": build_agent_metrics(
+                    tool_events,
+                    steps_used,
+                ),
+            }
+
+        choice = response.choices[0]
+
+        assistant_message = choice.message
+
+        finish_reason = choice.finish_reason
 
         tool_calls = (
             assistant_message.tool_calls
             or []
         )
 
-
         # ====================================================
-        # FINAL ANSWER
+        # NO TOOL CALL = FINAL ANSWER
         # ====================================================
 
         if not tool_calls:
 
-            final_content = (
+            answer = clean_model_output(
                 assistant_message.content
                 or ""
             )
 
-
-            print(
-                "✅ Agent finished."
+            truncated = (
+                finish_reason == "length"
             )
 
+            answer = add_truncation_notice(
+                answer,
+                truncated,
+            )
 
             return {
-                "content": final_content,
+                "content": answer,
                 "tools": tool_events,
-                "sources": all_sources
+                "metrics": build_agent_metrics(
+                    tool_events,
+                    steps_used,
+                    truncated,
+                ),
             }
 
-
         # ====================================================
-        # TOOL CALL MESSAGE
+        # ADD ASSISTANT TOOL CALL TO MESSAGE HISTORY
         # ====================================================
 
         messages.append(
@@ -733,18 +760,16 @@ def ask_llm(
                                 tool_call
                                 .function
                                 .arguments
-                            )
-                        }
+                            ),
+                        },
                     }
-                    for tool_call
-                    in tool_calls
-                ]
+                    for tool_call in tool_calls
+                ],
             }
         )
 
-
         # ====================================================
-        # EXECUTE EACH TOOL
+        # EXECUTE TOOL CALLS
         # ====================================================
 
         for tool_call in tool_calls:
@@ -755,7 +780,6 @@ def ask_llm(
                 .name
             )
 
-
             arguments = (
                 parse_tool_arguments(
                     tool_call
@@ -764,117 +788,85 @@ def ask_llm(
                 )
             )
 
+            # ------------------------------------------------
+            # REPEATED TOOL PROTECTION
+            # ------------------------------------------------
+
+            if tool_name in used_tools:
+
+                duplicate_result = {
+                    "success": False,
+                    "error": (
+                        f"{tool_name} has already been used "
+                        "for this request. Use the previous "
+                        "tool result and answer the user."
+                    ),
+                }
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": (
+                            tool_call.id
+                        ),
+                        "content": json.dumps(
+                            duplicate_result,
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+
+                continue
 
             # ------------------------------------------------
-            # WEB SEARCH SAFETY LIMIT
+            # WEB RESULT LIMIT
             # ------------------------------------------------
 
             if tool_name == "web_search":
 
-                try:
-
-                    requested_results = int(
-                        arguments.get(
-                            "max_results",
-                            3
-                        )
-                    )
-
-                except (
-                    TypeError,
-                    ValueError
-                ):
-
-                    requested_results = 3
-
-
+                # Model cannot control this.
                 arguments[
                     "max_results"
-                ] = max(
-                    1,
-                    min(
-                        requested_results,
-                        3
-                    )
-                )
-
+                ] = MAX_WEB_RESULTS
 
             # ------------------------------------------------
-            # LOG TOOL CALL
-            # ------------------------------------------------
-
-            print(
-                f"🔧 TOOL CALLED: "
-                f"{tool_name}"
-            )
-
-
-            print(
-                f"Arguments: "
-                f"{arguments}"
-            )
-
-
-            # ------------------------------------------------
-            # EXECUTE TOOL
+            # EXECUTE
             # ------------------------------------------------
 
             tool_result = execute_tool(
                 tool_name,
-                arguments
+                arguments,
             )
 
-
-            if isinstance(
-                tool_result,
-                dict
-            ):
-
-                print(
-                    "Tool success: "
-                    f"{tool_result.get('success')}"
+            success = (
+                isinstance(
+                    tool_result,
+                    dict,
                 )
-
-            else:
-
-                print(
-                    "Tool executed."
+                and tool_result.get(
+                    "success",
+                    False,
                 )
+            )
 
+            status = (
+                "completed"
+                if success
+                else "failed"
+            )
 
-            # ------------------------------------------------
-            # SAVE TOOL EVENT
-            # ------------------------------------------------
+            used_tools.add(
+                tool_name
+            )
 
             tool_events.append(
                 {
                     "name": tool_name,
                     "arguments": arguments,
-                    "result": tool_result
+                    "result": tool_result,
+                    "status": status,
                 }
             )
-
-
-            # ------------------------------------------------
-            # SAVE RAG SOURCES
-            # ------------------------------------------------
-
-            sources = extract_sources(
-                tool_name,
-                tool_result
-            )
-
-
-            if sources:
-
-                all_sources.extend(
-                    sources
-                )
-
-
-            # ------------------------------------------------
-            # RETURN TOOL RESULT TO GROQ
-            # ------------------------------------------------
 
             messages.append(
                 {
@@ -885,21 +877,392 @@ def ask_llm(
                     "content": json.dumps(
                         tool_result,
                         ensure_ascii=False,
-                        default=str
-                    )
+                        default=str,
+                    ),
                 }
             )
 
+        # ====================================================
+        # WEB SEARCH COMPLETED
+        #
+        # Force final synthesis instead of allowing the model
+        # to call web_search repeatedly.
+        # ====================================================
+
+        if "web_search" in used_tools:
+
+            steps_used = min(
+                step + 1,
+                MAX_AGENT_STEPS,
+            )
+
+            try:
+                final_response = (
+                    client.chat
+                    .completions.create(
+                        model=MODEL_NAME,
+                        messages=messages,
+                        tool_choice="none",
+                        reasoning_effort=(
+                            DEFAULT_REASONING_EFFORT
+                        ),
+                        reasoning_format="hidden",
+                        temperature=0.3,
+                        max_completion_tokens=(
+                            MAX_OUTPUT_TOKENS
+                        ),
+                    )
+                )
+
+            except Exception as error:
+
+                error_text = str(error)
+
+                if is_rate_limit_error(
+                    error_text
+                ):
+                    content = (
+                        "Web search completed, but Groq's "
+                        "rate limit was reached while generating "
+                        "the final answer. Please wait briefly "
+                        "and try again."
+                    )
+
+                else:
+                    content = (
+                        "Web search completed, but final "
+                        "answer generation failed:\n\n"
+                        f"`{error_text}`"
+                    )
+
+                return {
+                    "content": content,
+                    "tools": tool_events,
+                    "metrics": (
+                        build_agent_metrics(
+                            tool_events,
+                            steps_used,
+                        )
+                    ),
+                }
+
+            final_choice = (
+                final_response
+                .choices[0]
+            )
+
+            answer = clean_model_output(
+                final_choice
+                .message
+                .content
+                or ""
+            )
+
+            truncated = (
+                final_choice.finish_reason
+                == "length"
+            )
+
+            answer = add_truncation_notice(
+                answer,
+                truncated,
+            )
+
+            return {
+                "content": answer,
+                "tools": tool_events,
+                "metrics": (
+                    build_agent_metrics(
+                        tool_events,
+                        steps_used,
+                        truncated,
+                    )
+                ),
+            }
 
     # ========================================================
-    # MAX STEPS REACHED
+    # MAX AGENT STEPS
     # ========================================================
 
     return {
         "content": (
-            "I reached the maximum number of "
-            "agent steps before completing the request."
+            "I reached the maximum agent execution limit "
+            "before completing the request."
         ),
         "tools": tool_events,
-        "sources": all_sources
+        "metrics": build_agent_metrics(
+            tool_events,
+            steps_used,
+        ),
+    }
+
+
+# ============================================================
+# DOCUMENT RAG
+# ============================================================
+
+def ask_rag(
+    question,
+    rag_result,
+    rag_history=None,
+):
+
+    # ========================================================
+    # VALIDATION
+    # ========================================================
+
+    if not rag_result:
+        return {
+            "content": (
+                "No document retrieval result "
+                "was available."
+            ),
+            "metrics": {
+                "retrieval": (
+                    "Semantic + BM25 + RRF"
+                ),
+                "chunks_used": 0,
+                "pages_used": [],
+                "evidence_score": None,
+                "truncated": False,
+            },
+        }
+
+    if not rag_result.get(
+        "success",
+        False,
+    ):
+        return {
+            "content": rag_result.get(
+                "error",
+                "Document retrieval failed.",
+            ),
+            "metrics": {
+                "retrieval": (
+                    "Semantic + BM25 + RRF"
+                ),
+                "chunks_used": 0,
+                "pages_used": [],
+                "evidence_score": None,
+                "truncated": False,
+            },
+        }
+
+    sources = (
+        rag_result.get(
+            "sources",
+            [],
+        )
+        or []
+    )
+
+    if not sources:
+        return {
+            "content": (
+                "I couldn't find enough information in "
+                "the uploaded document to answer that question."
+            ),
+            "metrics": {
+                "retrieval": (
+                    "Semantic + BM25 + RRF"
+                ),
+                "chunks_used": 0,
+                "pages_used": [],
+                "evidence_score": None,
+                "truncated": False,
+            },
+        }
+
+    # ========================================================
+    # BUILD RETRIEVED CONTEXT
+    # ========================================================
+
+    context_parts = []
+
+    for index, source in enumerate(
+        sources,
+        start=1,
+    ):
+
+        context_parts.append(
+            (
+                f"SOURCE {index}\n"
+                f"Page: {source.get('page', '?')}\n"
+                f"Match: "
+                f"{source.get('match_type', 'Hybrid')}\n\n"
+                f"{source.get('text', '')}"
+            )
+        )
+
+    document_context = (
+        "\n\n---\n\n".join(
+            context_parts
+        )
+    )
+
+    # ========================================================
+    # MESSAGES
+    # ========================================================
+
+    messages = [
+        {
+            "role": "system",
+            "content": RAG_SYSTEM_PROMPT,
+        }
+    ]
+
+    # Only a few recent RAG messages are needed.
+    if rag_history:
+
+        for message in rag_history[-6:]:
+
+            role = message.get("role")
+
+            if role not in {
+                "user",
+                "assistant",
+            }:
+                continue
+
+            content = message.get(
+                "content",
+                "",
+            )
+
+            if not content:
+                continue
+
+            messages.append(
+                {
+                    "role": role,
+                    "content": content,
+                }
+            )
+
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "DOCUMENT CONTEXT\n"
+                "================\n\n"
+                f"{document_context}\n\n"
+                "USER QUESTION\n"
+                "=============\n\n"
+                f"{question}\n\n"
+                "Answer the question using ONLY the "
+                "document context above."
+            ),
+        }
+    )
+
+    # ========================================================
+    # RAG METRICS
+    # ========================================================
+
+    pages = sorted(
+        {
+            str(
+                source.get(
+                    "page",
+                    "?",
+                )
+            )
+            for source in sources
+        }
+    )
+
+    evidence_score = (
+        calculate_rag_evidence_score(
+            sources
+        )
+    )
+
+    # ========================================================
+    # GENERATE DOCUMENT-GROUNDED ANSWER
+    # ========================================================
+
+    try:
+        response = (
+            client.chat
+            .completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                reasoning_effort=(
+                    RAG_REASONING_EFFORT
+                ),
+                reasoning_format="hidden",
+                temperature=0.2,
+                max_completion_tokens=(
+                    MAX_OUTPUT_TOKENS
+                ),
+            )
+        )
+
+    except Exception as error:
+
+        error_text = str(error)
+
+        if is_rate_limit_error(
+            error_text
+        ):
+            content = (
+                "Groq rate limit reached. "
+                "Please wait briefly and try again."
+            )
+
+        else:
+            content = (
+                "The AI service returned an error:\n\n"
+                f"`{error_text}`"
+            )
+
+        return {
+            "content": content,
+            "metrics": {
+                "retrieval": (
+                    "Semantic + BM25 + RRF"
+                ),
+                "chunks_used": len(
+                    sources
+                ),
+                "pages_used": pages,
+                "evidence_score": (
+                    evidence_score
+                ),
+                "truncated": False,
+            },
+        }
+
+    choice = response.choices[0]
+
+    answer = clean_model_output(
+        choice.message.content
+        or ""
+    )
+
+    truncated = (
+        choice.finish_reason
+        == "length"
+    )
+
+    answer = add_truncation_notice(
+        answer,
+        truncated,
+    )
+
+    return {
+        "content": answer,
+        "metrics": {
+            "retrieval": (
+                "Semantic + BM25 + RRF"
+            ),
+            "chunks_used": len(
+                sources
+            ),
+            "pages_used": pages,
+            "evidence_score": (
+                evidence_score
+            ),
+            "truncated": truncated,
+        },
     }

@@ -3,12 +3,32 @@ import tempfile
 
 import streamlit as st
 
-# pyrefly: ignore [missing-import]
-from llm import ask_llm
+from database import (
+    init_database,
+    create_conversation,
+    get_conversation,
+    get_conversations,
+    get_messages,
+    save_message,
+    update_conversation_title,
+    delete_conversation,
+    clear_all_conversations,
+    delete_empty_conversations,
+    generate_title,
+)
+
+from llm import (
+    ask_assistant,
+    ask_rag,
+    MODEL_NAME,
+    MAX_AGENT_STEPS,
+    MAX_OUTPUT_TOKENS,
+)
 
 from rag.document_rag import (
     process_pdf,
-    set_active_document,
+    knowledge_base_search,
+    get_active_document,
     clear_active_document,
 )
 
@@ -18,135 +38,467 @@ from rag.document_rag import (
 # ============================================================
 
 st.set_page_config(
-    page_title="Anil AI",
-    page_icon="🤖",
+    page_title="Nexor AI",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 
 # ============================================================
+# DATABASE
+# ============================================================
+
+# SQLite works silently in the background.
+init_database()
+
+# Clean old empty "New chat" rows created by older versions.
+delete_empty_conversations()
+
+
+# ============================================================
 # SESSION STATE
 # ============================================================
 
-if "messages" not in st.session_state:
+DEFAULTS = {
+    "conversation_id": None,
+    "mode": "assistant",
+    "processed_pdf": None,
+    "document": None,
+    "chat_search": "",
+    "confirm_clear": False,
+}
 
-    st.session_state.messages = []
 
-
-if "document" not in st.session_state:
-
-    st.session_state.document = None
-
-
-if "suggested_prompt" not in st.session_state:
-
-    st.session_state.suggested_prompt = None
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 # ============================================================
-# RESTORE ACTIVE DOCUMENT
+# CONVERSATION HELPERS
 # ============================================================
 
-if st.session_state.document:
+def start_new_chat():
+    """
+    Start a new unsaved chat.
 
-    set_active_document(
-        st.session_state
-        .document["name"]
+    IMPORTANT:
+    Clicking New Chat does NOT create a SQLite row.
+
+    A conversation is saved only after the user
+    sends the first message.
+    """
+
+    st.session_state.conversation_id = None
+    st.session_state.confirm_clear = False
+
+
+def ensure_saved_conversation():
+    """
+    Create a SQLite conversation only when the user
+    actually sends the first message.
+    """
+
+    conversation_id = st.session_state.conversation_id
+
+    if conversation_id:
+        conversation = get_conversation(
+            conversation_id
+        )
+
+        if conversation:
+            return conversation_id
+
+    conversation_id = create_conversation(
+        mode=st.session_state.mode,
+        title="New chat",
     )
 
+    st.session_state.conversation_id = (
+        conversation_id
+    )
 
-# ============================================================
-# CLEAN UI CSS
-# ============================================================
+    return conversation_id
 
-st.markdown(
+
+def load_conversation(conversation_id):
     """
-<style>
+    Load a conversation from SQLite.
+    """
 
-/* ==========================================================
-   MAIN
-========================================================== */
+    conversation = get_conversation(
+        conversation_id
+    )
 
-.block-container {
+    if not conversation:
+        return
 
-    max-width: 1000px;
+    st.session_state.conversation_id = (
+        conversation_id
+    )
 
-    padding-top: 2rem;
+    st.session_state.mode = conversation.get(
+        "mode",
+        "assistant",
+    )
 
-    padding-bottom: 7rem;
-}
-
-
-/* ==========================================================
-   SIDEBAR
-========================================================== */
-
-[data-testid="stSidebar"] {
-
-    min-width: 290px;
-
-    max-width: 290px;
-}
+    st.session_state.confirm_clear = False
 
 
-/* ==========================================================
-   BUTTONS
-========================================================== */
+def change_mode(mode):
+    """
+    Change between AI Assistant and Document RAG.
 
-.stButton > button {
+    Existing conversations are preserved.
+    """
 
-    border-radius: 10px;
+    if mode not in {
+        "assistant",
+        "rag",
+    }:
+        return
 
-    min-height: 42px;
-}
+    if st.session_state.mode == mode:
+        return
 
+    st.session_state.mode = mode
 
-/* ==========================================================
-   CHAT
-========================================================== */
+    # Start a fresh unsaved chat in the selected mode.
+    st.session_state.conversation_id = None
 
-[data-testid="stChatMessage"] {
-
-    padding-top: 1rem;
-
-    padding-bottom: 1rem;
-}
-
-
-/* ==========================================================
-   INPUT
-========================================================== */
-
-[data-testid="stChatInput"] {
-
-    border-radius: 14px;
-}
+    st.session_state.confirm_clear = False
 
 
-/* ==========================================================
-   TYPOGRAPHY
-========================================================== */
+# ============================================================
+# AGENT ACTIVITY
+# ============================================================
 
-h1, h2, h3 {
+def display_agent_activity(
+    tools,
+    metrics,
+):
+    """
+    Display AI Assistant agent observability.
+    """
 
-    letter-spacing: -0.02em;
-}
+    if not tools and not metrics:
+        return
+
+    with st.expander(
+        "🛠 Agent Activity",
+        expanded=False,
+    ):
+
+        steps = metrics.get(
+            "steps_used",
+            1,
+        )
+
+        maximum = metrics.get(
+            "max_steps",
+            MAX_AGENT_STEPS,
+        )
+
+        tools_used = metrics.get(
+            "tools_used",
+            len(tools),
+        )
+
+        resources = metrics.get(
+            "resources_used",
+            0,
+        )
+
+        evidence = metrics.get(
+            "evidence_score"
+        )
+
+        # ----------------------------------------------------
+        # METRICS
+        # ----------------------------------------------------
+
+        col1, col2, col3, col4 = (
+            st.columns(4)
+        )
+
+        col1.metric(
+            "Agent Steps",
+            f"{steps}/{maximum}",
+        )
+
+        col2.metric(
+            "Tools Used",
+            tools_used,
+        )
+
+        col3.metric(
+            "Resources",
+            resources,
+        )
+
+        col4.metric(
+            "Evidence Score",
+            (
+                f"{evidence}%"
+                if evidence is not None
+                else "—"
+            ),
+        )
+
+        st.caption(
+            "Evidence Score is a retrieval heuristic, "
+            "not AI confidence."
+        )
+
+        # ----------------------------------------------------
+        # TOOL EVENTS
+        # ----------------------------------------------------
+
+        for event in tools:
+
+            st.divider()
+
+            name = event.get(
+                "name",
+                "tool",
+            )
+
+            status = event.get(
+                "status",
+                "completed",
+            )
+
+            icon = (
+                "✅"
+                if status == "completed"
+                else "❌"
+            )
+
+            if name == "web_search":
+                display_name = "Web Search"
+            else:
+                display_name = (
+                    name
+                    .replace("_", " ")
+                    .title()
+                )
+
+            st.markdown(
+                f"{icon} **{display_name}** · {status}"
+            )
+
+            arguments = event.get(
+                "arguments",
+                {},
+            )
+
+            query = arguments.get(
+                "query"
+            )
+
+            if query:
+                st.caption(
+                    f'Search: "{query}"'
+                )
+
+            # ------------------------------------------------
+            # WEB SEARCH RESOURCES
+            # ------------------------------------------------
+
+            if name == "web_search":
+
+                result = event.get(
+                    "result",
+                    {},
+                )
+
+                web_results = (
+                    result.get(
+                        "results",
+                        [],
+                    )
+                    or []
+                )
+
+                if web_results:
+                    st.markdown(
+                        "**Resources used**"
+                    )
+
+                for index, resource in enumerate(
+                    web_results,
+                    start=1,
+                ):
+
+                    title = (
+                        resource.get("title")
+                        or f"Resource {index}"
+                    )
+
+                    url = resource.get(
+                        "url",
+                        "",
+                    )
+
+                    snippet = resource.get(
+                        "snippet",
+                        "",
+                    )
+
+                    if url:
+                        st.markdown(
+                            f"{index}. [{title}]({url})"
+                        )
+                    else:
+                        st.markdown(
+                            f"{index}. {title}"
+                        )
+
+                    if snippet:
+                        st.caption(
+                            snippet[:250]
+                        )
 
 
-/* ==========================================================
-   FOOTER
-========================================================== */
+# ============================================================
+# RAG ACTIVITY
+# ============================================================
 
-footer {
+def display_rag_activity(
+    sources,
+    metrics,
+):
+    """
+    Display Hybrid RAG retrieval information.
+    """
 
-    visibility: hidden;
-}
+    if not sources and not metrics:
+        return
 
-</style>
-""",
-    unsafe_allow_html=True,
-)
+    with st.expander(
+        "📚 RAG Activity",
+        expanded=False,
+    ):
+
+        chunks = metrics.get(
+            "chunks_used",
+            len(sources),
+        )
+
+        pages = metrics.get(
+            "pages_used",
+            [],
+        )
+
+        evidence = metrics.get(
+            "evidence_score"
+        )
+
+        # ----------------------------------------------------
+        # METRICS
+        # ----------------------------------------------------
+
+        col1, col2, col3, col4 = (
+            st.columns(4)
+        )
+
+        col1.metric(
+            "Retrieval",
+            "Hybrid",
+        )
+
+        col2.metric(
+            "Chunks Used",
+            chunks,
+        )
+
+        col3.metric(
+            "Pages",
+            len(pages),
+        )
+
+        col4.metric(
+            "Evidence Score",
+            (
+                f"{evidence}%"
+                if evidence is not None
+                else "—"
+            ),
+        )
+
+        st.caption(
+            "Semantic Search + BM25 + "
+            "Reciprocal Rank Fusion"
+        )
+
+        if pages:
+            st.caption(
+                "Pages used: "
+                + ", ".join(
+                    str(page)
+                    for page in pages
+                )
+            )
+
+        st.caption(
+            "Evidence Score measures retrieval quality. "
+            "It is not AI confidence."
+        )
+
+        # ----------------------------------------------------
+        # SOURCES
+        # ----------------------------------------------------
+
+        for index, source in enumerate(
+            sources,
+            start=1,
+        ):
+
+            st.divider()
+
+            page = source.get(
+                "page",
+                "?",
+            )
+
+            match_type = source.get(
+                "match_type",
+                "Hybrid",
+            )
+
+            relevance = source.get(
+                "relevance",
+                0,
+            )
+
+            semantic = source.get(
+                "semantic_relevance",
+                0,
+            )
+
+            keyword = source.get(
+                "keyword_score",
+                0,
+            )
+
+            st.markdown(
+                f"**Source {index} · Page {page}**"
+            )
+
+            st.caption(
+                f"{match_type}"
+                f" · Hybrid {relevance}%"
+                f" · Semantic {semantic}%"
+                f" · BM25 {keyword}"
+            )
+
+            st.write(
+                source.get(
+                    "text",
+                    "",
+                )
+            )
 
 
 # ============================================================
@@ -155,11 +507,12 @@ footer {
 
 with st.sidebar:
 
-    st.title("🤖⚡ Nexora AI")
+    st.title(
+        "⚡ Nexor AI"
+    )
 
     st.caption(
-        "Agentic AI assistant powered by tool calling, "
-        "real-time web search, and Hybrid RAG."
+        "Agentic AI + Hybrid RAG"
     )
 
     # ========================================================
@@ -167,991 +520,980 @@ with st.sidebar:
     # ========================================================
 
     if st.button(
-        "＋ New chat",
-        type="primary",
+        "✎ New chat",
         use_container_width=True,
+        type="primary",
+        key="new_chat_button",
     ):
 
-        st.session_state.messages = []
+        start_new_chat()
+
+        st.rerun()
+
+    # ========================================================
+    # SEARCH
+    # ========================================================
+
+    search_query = st.text_input(
+        "Search chats",
+        key="chat_search",
+        placeholder="Search chats...",
+        label_visibility="collapsed",
+    )
+
+    # ========================================================
+    # AI MODES
+    # ========================================================
+
+    st.markdown(
+        "### AI Modes"
+    )
+
+    assistant_label = (
+        "✓ 💬 AI Assistant"
+        if st.session_state.mode == "assistant"
+        else "💬 AI Assistant"
+    )
+
+    rag_label = (
+        "✓ 📚 Document RAG"
+        if st.session_state.mode == "rag"
+        else "📚 Document RAG"
+    )
+
+    if st.button(
+        assistant_label,
+        use_container_width=True,
+        key="assistant_mode_button",
+    ):
+
+        change_mode(
+            "assistant"
+        )
+
+        st.rerun()
+
+    if st.button(
+        rag_label,
+        use_container_width=True,
+        key="rag_mode_button",
+    ):
+
+        change_mode(
+            "rag"
+        )
+
+        st.rerun()
+
+    # ========================================================
+    # RECENTS
+    # ========================================================
+
+    st.markdown(
+        "### Recents"
+    )
+
+    # Normal:
+    # only latest 5 chats.
+    #
+    # Search:
+    # search up to 50 saved chats.
+
+    if search_query.strip():
+
+        conversations = get_conversations(
+            search_query=search_query.strip(),
+            limit=50,
+        )
+
+    else:
+
+        conversations = get_conversations(
+            search_query="",
+            limit=5,
+        )
+
+    # --------------------------------------------------------
+    # NO RESULTS
+    # --------------------------------------------------------
+
+    if (
+        search_query.strip()
+        and not conversations
+    ):
+
+        st.caption(
+            "No matching chats."
+        )
+
+    elif not conversations:
+
+        st.caption(
+            "No conversations yet."
+        )
+
+    # --------------------------------------------------------
+    # RECENT CHAT BUTTONS
+    # --------------------------------------------------------
+
+    for conversation_item in conversations:
+
+        recent_id = (
+            conversation_item["id"]
+        )
+
+        title = (
+            conversation_item["title"]
+        )
+
+        conversation_mode = (
+            conversation_item.get(
+                "mode",
+                "assistant",
+            )
+        )
+
+        mode_icon = (
+            "📚"
+            if conversation_mode == "rag"
+            else "💬"
+        )
+
+        is_active = (
+            recent_id
+            == st.session_state.conversation_id
+        )
+
+        if is_active:
+
+            label = (
+                f"› {mode_icon} {title}"
+            )
+
+        else:
+
+            label = (
+                f"{mode_icon} {title}"
+            )
+
+        if st.button(
+            label,
+            key=f"recent_{recent_id}",
+            use_container_width=True,
+        ):
+
+            load_conversation(
+                recent_id
+            )
+
+            st.rerun()
+
+    # ========================================================
+    # CURRENT CHAT OPTIONS
+    # ========================================================
+
+    current_id = (
+        st.session_state.conversation_id
+    )
+
+    current_conversation = (
+        get_conversation(
+            current_id
+        )
+        if current_id
+        else None
+    )
+
+    if current_conversation:
+
+        with st.expander(
+            "⋯ Chat options"
+        ):
+
+            new_title = st.text_input(
+                "Conversation title",
+                value=current_conversation[
+                    "title"
+                ],
+                key=(
+                    "rename_"
+                    + current_id
+                ),
+            )
+
+            # ------------------------------------------------
+            # RENAME CURRENT CHAT
+            # ------------------------------------------------
+
+            if st.button(
+                "Rename",
+                use_container_width=True,
+                key=(
+                    "rename_button_"
+                    + current_id
+                ),
+            ):
+
+                if new_title.strip():
+
+                    update_conversation_title(
+                        current_id,
+                        new_title.strip(),
+                    )
+
+                    st.rerun()
+
+            # ------------------------------------------------
+            # DELETE CURRENT CHAT
+            # ------------------------------------------------
+
+            if st.button(
+                "🗑 Delete this chat",
+                use_container_width=True,
+                key=(
+                    "delete_button_"
+                    + current_id
+                ),
+            ):
+
+                delete_conversation(
+                    current_id
+                )
+
+                start_new_chat()
+
+                st.rerun()
+
+    # ========================================================
+    # CLEAR ALL CHATS
+    # ========================================================
+
+    st.divider()
+
+    if not st.session_state.confirm_clear:
+
+        if st.button(
+            "🗑 Clear all chats",
+            use_container_width=True,
+            key="clear_all_button",
+        ):
+
+            st.session_state.confirm_clear = True
+
+            st.rerun()
+
+    else:
+
+        st.warning(
+            "Delete all conversation history?"
+        )
+
+        confirm_col, cancel_col = (
+            st.columns(2)
+        )
+
+        # ----------------------------------------------------
+        # CONFIRM
+        # ----------------------------------------------------
+
+        with confirm_col:
+
+            if st.button(
+                "Yes, clear",
+                use_container_width=True,
+                type="primary",
+                key="confirm_clear_button",
+            ):
+
+                clear_all_conversations()
+
+                # IMPORTANT:
+                # We DO NOT modify chat_search here.
+                #
+                # chat_search is already instantiated above
+                # as a Streamlit widget.
+                #
+                # Changing:
+                #
+                # st.session_state["chat_search"] = ""
+                #
+                # here causes:
+                #
+                # StreamlitWidgetAlreadyInstantiatedError
+
+                st.session_state[
+                    "conversation_id"
+                ] = None
+
+                st.session_state[
+                    "confirm_clear"
+                ] = False
+
+                st.rerun()
+
+        # ----------------------------------------------------
+        # CANCEL
+        # ----------------------------------------------------
+
+        with cancel_col:
+
+            if st.button(
+                "Cancel",
+                use_container_width=True,
+                key="cancel_clear_button",
+            ):
+
+                st.session_state[
+                    "confirm_clear"
+                ] = False
+
+                st.rerun()
+
+    # ========================================================
+    # SYSTEM
+    # ========================================================
+
+    with st.expander(
+        "⚙ System",
+        expanded=False,
+    ):
+
+        st.write(
+            "**GPT-OSS 120B**"
+        )
+
+        st.caption(
+            MODEL_NAME
+        )
+
+        st.write(
+            f"**Agent limit:** "
+            f"{MAX_AGENT_STEPS} steps"
+        )
+
+        st.write(
+            f"**Output ceiling:** "
+            f"{MAX_OUTPUT_TOKENS} tokens"
+        )
+
+        st.write(
+            "**Reasoning:** Low"
+        )
+
+        st.write(
+            "**Web results:** Max 3"
+        )
+
+
+# ============================================================
+# CURRENT CONVERSATION
+# ============================================================
+
+conversation_id = (
+    st.session_state.conversation_id
+)
+
+conversation = (
+    get_conversation(
+        conversation_id
+    )
+    if conversation_id
+    else None
+)
+
+messages = (
+    get_messages(
+        conversation_id
+    )
+    if conversation_id
+    else []
+)
+
+
+# ============================================================
+# MAIN HEADER
+# ============================================================
+
+st.title(
+    "⚡ Nexor AI"
+)
+
+if conversation:
+
+    st.caption(
+        conversation.get(
+            "title",
+            "New chat",
+        )
+    )
+
+else:
+
+    st.caption(
+        "New chat"
+    )
+
+
+# ============================================================
+# AI ASSISTANT MODE
+# ============================================================
+
+if st.session_state.mode == "assistant":
+
+    st.markdown(
+        "### 💬 AI Assistant"
+    )
+
+    st.caption(
+        "GPT-OSS 120B with agentic web search "
+        "for current information."
+    )
+
+    # ========================================================
+    # EMPTY CHAT STARTER
+    # ========================================================
+
+    if not messages:
+
+        col1, col2, col3 = (
+            st.columns(3)
+        )
+
+        with col1:
+
+            st.markdown(
+                "#### 🧠 Learn"
+            )
+
+            st.caption(
+                "AI, Python, ML and "
+                "technical concepts."
+            )
+
+        with col2:
+
+            st.markdown(
+                "#### 🌐 Research"
+            )
+
+            st.caption(
+                "Current information with "
+                "web search."
+            )
+
+        with col3:
+
+            st.markdown(
+                "#### ⚙ Build"
+            )
+
+            st.caption(
+                "Agents, RAG systems and "
+                "AI applications."
+            )
+
+    # ========================================================
+    # DISPLAY CHAT HISTORY
+    # ========================================================
+
+    for message in messages:
+
+        with st.chat_message(
+            message["role"]
+        ):
+
+            st.markdown(
+                message.get(
+                    "content",
+                    "",
+                )
+            )
+
+            if message["role"] == "assistant":
+
+                display_agent_activity(
+                    message.get(
+                        "tools",
+                        [],
+                    ),
+                    message.get(
+                        "metrics",
+                        {},
+                    ),
+                )
+
+    # ========================================================
+    # CHAT INPUT
+    # ========================================================
+
+    prompt = st.chat_input(
+        "Message Nexor AI...",
+        key="assistant_input",
+    )
+
+    if prompt:
+
+        # ----------------------------------------------------
+        # SAVE CONVERSATION ONLY WHEN FIRST MESSAGE IS SENT
+        # ----------------------------------------------------
+
+        conversation_id = (
+            ensure_saved_conversation()
+        )
+
+        existing_messages = (
+            get_messages(
+                conversation_id
+            )
+        )
+
+        first_user_message = (
+            len(existing_messages) == 0
+        )
+
+        # ----------------------------------------------------
+        # CREATE TITLE
+        # ----------------------------------------------------
+
+        if first_user_message:
+
+            update_conversation_title(
+                conversation_id,
+                generate_title(
+                    prompt
+                ),
+            )
+
+        # ----------------------------------------------------
+        # SAVE USER MESSAGE
+        # ----------------------------------------------------
+
+        save_message(
+            conversation_id,
+            "user",
+            prompt,
+        )
+
+        # ----------------------------------------------------
+        # GET HISTORY
+        # ----------------------------------------------------
+
+        current_history = (
+            get_messages(
+                conversation_id
+            )
+        )
+
+        # ----------------------------------------------------
+        # DISPLAY USER
+        # ----------------------------------------------------
+
+        with st.chat_message(
+            "user"
+        ):
+
+            st.markdown(
+                prompt
+            )
+
+        # ----------------------------------------------------
+        # GENERATE RESPONSE
+        # ----------------------------------------------------
+
+        with st.chat_message(
+            "assistant"
+        ):
+
+            with st.spinner(
+                "Nexor AI is thinking..."
+            ):
+
+                result = ask_assistant(
+                    current_history
+                )
+
+            answer = result.get(
+                "content",
+                "",
+            )
+
+            tools = result.get(
+                "tools",
+                [],
+            )
+
+            metrics = result.get(
+                "metrics",
+                {},
+            )
+
+            st.markdown(
+                answer
+            )
+
+            display_agent_activity(
+                tools,
+                metrics,
+            )
+
+        # ----------------------------------------------------
+        # SAVE ASSISTANT RESPONSE
+        # ----------------------------------------------------
+
+        save_message(
+            conversation_id,
+            "assistant",
+            answer,
+            tools=tools,
+            metrics=metrics,
+        )
 
         st.rerun()
 
 
-    st.divider()
+# ============================================================
+# DOCUMENT RAG MODE
+# ============================================================
 
+else:
 
-    # ========================================================
-    # STATUS
-    # ========================================================
+    st.markdown(
+        "### 📚 Document RAG"
+    )
 
     st.caption(
-        "STATUS"
+        "Hybrid retrieval using Semantic Search + "
+        "BM25 + RRF. Answers use only the uploaded PDF."
     )
-
-
-    st.success(
-        "● Agent online"
-    )
-
-
-    st.caption(
-        "Groq inference active"
-    )
-
-
-    st.divider()
-
 
     # ========================================================
-    # TOOLS
+    # PDF UPLOAD
     # ========================================================
 
-    st.caption(
-        "AGENT TOOLS"
+    uploaded_file = st.file_uploader(
+        "Upload a PDF",
+        type=["pdf"],
+        key="rag_pdf",
     )
 
-
-    st.write(
-        "🌐 Web search"
-    )
-
-
-    st.write(
-        "🧮 Calculator"
-    )
-
-
-    st.write(
-        "📚 Hybrid knowledge search"
-    )
-
-
-    st.caption(
-        "Semantic + BM25 + RRF"
-    )
-
-
-    st.divider()
-
-
-    # ========================================================
-    # KNOWLEDGE BASE
-    # ========================================================
-
-    st.caption(
-        "KNOWLEDGE BASE"
-    )
-
-
-    uploaded_file = (
-        st.file_uploader(
-
-            "Upload PDF",
-
-            type=[
-                "pdf"
-            ],
-
-            label_visibility=
-                "collapsed"
-        )
-    )
-
-
-    # ========================================================
-    # PROCESS PDF
-    # ========================================================
-
-    if uploaded_file is not None:
-
-        current_document = (
-            st.session_state
-            .document
-        )
-
+    if uploaded_file:
 
         should_process = (
-
-            current_document
-            is None
-
-            or
-
-            current_document.get(
-                "name"
-            )
-            !=
-            uploaded_file.name
+            st.session_state.processed_pdf
+            != uploaded_file.name
         )
-
 
         if should_process:
 
             temp_path = None
 
+            with st.spinner(
+                "Building Hybrid RAG index..."
+            ):
 
-            try:
-
-                with st.status(
-                    "Building knowledge base...",
-                    expanded=True
-                ) as status:
-
-
-                    st.write(
-                        "📄 Reading PDF"
-                    )
-
+                try:
 
                     with tempfile.NamedTemporaryFile(
                         delete=False,
-                        suffix=".pdf"
+                        suffix=".pdf",
                     ) as temp_file:
 
                         temp_file.write(
-                            uploaded_file
-                            .getvalue()
+                            uploaded_file.getbuffer()
                         )
-
 
                         temp_path = (
                             temp_file.name
                         )
 
-
-                    st.write(
-                        "✂️ Creating chunks"
-                    )
-
-
-                    st.write(
-                        "🧠 Generating embeddings"
-                    )
-
-
-                    st.write(
-                        "💾 Building vector index"
-                    )
-
-
                     result = process_pdf(
-
                         temp_path,
-
-                        uploaded_file.name
+                        uploaded_file.name,
                     )
-
 
                     if result.get(
                         "success"
                     ):
 
-                        st.session_state.document = {
+                        st.session_state[
+                            "document"
+                        ] = uploaded_file.name
 
-                            "name":
-                                uploaded_file.name,
+                        st.session_state[
+                            "processed_pdf"
+                        ] = uploaded_file.name
 
-                            "pages":
-                                result[
-                                    "pages"
-                                ],
-
-                            "chunks":
-                                result[
-                                    "chunks"
-                                ]
-                        }
-
-
-                        set_active_document(
-                            uploaded_file.name
+                        st.success(
+                            "PDF indexed successfully."
                         )
 
-
-                        status.update(
-
-                            label=
-                                "Knowledge base ready",
-
-                            state=
-                                "complete",
-
-                            expanded=
-                                False
+                        st.caption(
+                            f"{result.get('pages', 0)} "
+                            f"readable pages · "
+                            f"{result.get('chunks', 0)} chunks"
                         )
-
-
-                        st.rerun()
-
 
                     else:
-
-                        status.update(
-
-                            label=
-                                "PDF processing failed",
-
-                            state=
-                                "error"
-                        )
-
 
                         st.error(
                             result.get(
                                 "error",
-                                "Unable to process PDF."
+                                "PDF indexing failed.",
                             )
                         )
 
+                finally:
 
-            except Exception as error:
-
-                st.error(
-                    f"PDF error: {error}"
-                )
-
-
-            finally:
-
-                if (
-                    temp_path
-
-                    and
-
-                    os.path.exists(
+                    if (
                         temp_path
-                    )
-                ):
-
-                    try:
-
-                        os.remove(
+                        and os.path.exists(
                             temp_path
                         )
+                    ):
 
-                    except OSError:
+                        try:
 
-                        pass
+                            os.remove(
+                                temp_path
+                            )
 
+                        except OSError:
+                            pass
 
     # ========================================================
     # ACTIVE DOCUMENT
     # ========================================================
 
-    if st.session_state.document:
-
-        document = (
-            st.session_state
-            .document
-        )
-
-
-        st.success(
-            "✓ Knowledge base ready"
-        )
-
-
-        st.markdown(
-            f"📄 **{document['name']}**"
-        )
-
-
-        st.caption(
-            f"{document['pages']} pages · "
-            f"{document['chunks']} chunks"
-        )
-
-
-        st.caption(
-            "🧠 Semantic · 🔤 BM25 · 🔀 RRF"
-        )
-
-
-        if st.button(
-            "Remove PDF",
-            use_container_width=True
-        ):
-
-            st.session_state.document = None
-
-            clear_active_document()
-
-            st.rerun()
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.title(
-    "Anil AI"
-)
-
-
-st.caption(
-    "Agentic AI · Groq · Tools · Hybrid RAG"
-)
-
-
-# ============================================================
-# ACTIVE DOCUMENT INDICATOR
-# ============================================================
-
-if st.session_state.document:
-
-    document = (
-        st.session_state
-        .document
+    active_document = (
+        get_active_document()
     )
 
+    if active_document:
 
-    st.caption(
-        f"📚 Active knowledge base: "
-        f"{document['name']}"
-    )
-
-
-st.divider()
-
-
-# ============================================================
-# EXTRACT KNOWLEDGE SOURCES
-# ============================================================
-
-def extract_kb_sources(
-    tools_used
-):
-
-    sources = []
-
-
-    for tool in tools_used:
-
-        if (
-            tool.get("tool")
-            !=
-            "knowledge_base_search"
-        ):
-
-            continue
-
-
-        result = tool.get(
-            "result",
-            {}
-        )
-
-
-        if not isinstance(
-            result,
-            dict
-        ):
-
-            continue
-
-
-        sources.extend(
-            result.get(
-                "sources",
-                []
+        doc_col1, doc_col2 = (
+            st.columns(
+                [5, 1]
             )
         )
 
+        with doc_col1:
 
-    return sources
-
-
-# ============================================================
-# DISPLAY TOOL EVENT
-# ============================================================
-
-def display_tool_event(
-    tool
-):
-
-    tool_name = (
-        tool.get(
-            "tool",
-            "unknown"
-        )
-    )
-
-
-    labels = {
-
-        "calculator":
-            "🧮 Calculator",
-
-        "web_search":
-            "🌐 Web search",
-
-        "knowledge_base_search":
-            "📚 Hybrid knowledge search"
-    }
-
-
-    label = labels.get(
-        tool_name,
-        tool_name
-    )
-
-
-    with st.expander(
-        f"{label} · completed"
-    ):
-
-        arguments = tool.get(
-            "arguments",
-            {}
-        )
-
-
-        if arguments:
-
-            st.caption(
-                "Query / Input"
+            st.info(
+                f"📘 Active document: "
+                f"{active_document}"
             )
 
+        with doc_col2:
 
-            st.json(
-                arguments
-            )
-
-
-        # Do not dump huge RAG JSON
-        if (
-            tool_name
-            !=
-            "knowledge_base_search"
-        ):
-
-            result = tool.get(
-                "result",
-                {}
-            )
-
-
-            st.caption(
-                "Result"
-            )
-
-
-            if isinstance(
-                result,
-                (dict, list)
+            if st.button(
+                "Remove PDF",
+                use_container_width=True,
+                key="remove_pdf_button",
             ):
 
-                st.json(
-                    result
-                )
+                clear_active_document()
 
-            else:
+                st.session_state[
+                    "document"
+                ] = None
 
-                st.write(
-                    result
-                )
+                st.session_state[
+                    "processed_pdf"
+                ] = None
 
+                st.rerun()
 
-# ============================================================
-# DISPLAY RAG SOURCES
-# ============================================================
+    else:
 
-def display_sources(
-    sources
-):
+        st.info(
+            "Upload a PDF to start Document RAG."
+        )
 
-    if not sources:
+    # ========================================================
+    # DISPLAY RAG HISTORY
+    # ========================================================
 
-        return
+    for message in messages:
 
-
-    with st.expander(
-        f"📚 Sources · "
-        f"{len(sources)} retrieved",
-        expanded=False
-    ):
-
-        for index, source in enumerate(
-            sources,
-            start=1
+        with st.chat_message(
+            message["role"]
         ):
-
-            page = source.get(
-                "page",
-                "?"
-            )
-
-
-            relevance = source.get(
-                "relevance",
-                0
-            )
-
-
-            semantic = source.get(
-                "semantic_relevance",
-                0
-            )
-
-
-            keyword = source.get(
-                "keyword_score",
-                0
-            )
-
-
-            match_type = source.get(
-                "match_type",
-                "Hybrid"
-            )
-
-
-            # ================================================
-            # SOURCE HEADER
-            # ================================================
 
             st.markdown(
-                f"### Source {index}"
-            )
-
-
-            st.markdown(
-                f"**Page {page}** · "
-                f"{match_type}"
-            )
-
-
-            st.caption(
-                f"Hybrid relevance: "
-                f"{relevance}% · "
-                f"Semantic: "
-                f"{semantic}% · "
-                f"BM25: "
-                f"{keyword}"
-            )
-
-
-            # ================================================
-            # SOURCE TEXT
-            # ================================================
-
-            st.write(
-                source.get(
-                    "text",
-                    ""
+                message.get(
+                    "content",
+                    "",
                 )
             )
 
+            if message["role"] == "assistant":
 
-            if index < len(
-                sources
-            ):
-
-                st.divider()
-
-
-# ============================================================
-# EMPTY STATE
-# ============================================================
-
-if not st.session_state.messages:
-
-    st.write("")
-
-
-    st.subheader(
-        "How can I help?"
-    )
-
-
-    st.caption(
-        "Ask anything, search the web, "
-        "calculate, or chat with your PDF."
-    )
-
-
-    col1, col2 = (
-        st.columns(2)
-    )
-
+                display_rag_activity(
+                    message.get(
+                        "sources",
+                        [],
+                    ),
+                    message.get(
+                        "metrics",
+                        {},
+                    ),
+                )
 
     # ========================================================
-    # LEFT
+    # RAG INPUT
     # ========================================================
 
-    with col1:
+    if active_document:
 
-        if st.button(
-            "📚 Explain RAG from my PDF",
-            use_container_width=True
-        ):
-
-            st.session_state.suggested_prompt = (
-                "According to my uploaded PDF, "
-                "explain RAG."
-            )
-
-
-            st.rerun()
-
-
-        if st.button(
-            "🌐 Latest AI news",
-            use_container_width=True
-        ):
-
-            st.session_state.suggested_prompt = (
-                "What is the latest AI news today?"
-            )
-
-
-            st.rerun()
-
-
-    # ========================================================
-    # RIGHT
-    # ========================================================
-
-    with col2:
-
-        if st.button(
-            "🧠 Explain Agentic AI",
-            use_container_width=True
-        ):
-
-            st.session_state.suggested_prompt = (
-                "Explain Agentic AI with "
-                "a practical example."
-            )
-
-
-            st.rerun()
-
-
-        if st.button(
-            "🧮 Calculate 9382 × 72",
-            use_container_width=True
-        ):
-
-            st.session_state.suggested_prompt = (
-                "Calculate 9382 * 72"
-            )
-
-
-            st.rerun()
-
-
-# ============================================================
-# CHAT HISTORY
-# ============================================================
-
-for message in (
-    st.session_state.messages
-):
-
-    role = message.get(
-        "role"
-    )
-
-
-    content = message.get(
-        "content",
-        ""
-    )
-
-
-    if role not in [
-        "user",
-        "assistant"
-    ]:
-
-        continue
-
-
-    if not content:
-
-        continue
-
-
-    avatar = (
-
-        "👤"
-
-        if role == "user"
-
-        else "🤖"
-    )
-
-
-    with st.chat_message(
-        role,
-        avatar=avatar
-    ):
-
-        tools_used = (
-            message.get(
-                "tools",
-                []
-            )
+        rag_prompt = st.chat_input(
+            "Ask about the document...",
+            key="rag_input",
         )
 
+        if rag_prompt:
 
-        # ====================================================
-        # TOOL TRACE
-        # ====================================================
+            # ------------------------------------------------
+            # CREATE CONVERSATION ON FIRST REAL QUESTION
+            # ------------------------------------------------
 
-        for tool in tools_used:
-
-            display_tool_event(
-                tool
+            conversation_id = (
+                ensure_saved_conversation()
             )
 
+            existing_messages = (
+                get_messages(
+                    conversation_id
+                )
+            )
 
-        # ====================================================
-        # RAG SOURCES
-        # ====================================================
+            first_user_message = (
+                len(existing_messages) == 0
+            )
 
-        sources = extract_kb_sources(
-            tools_used
-        )
+            # ------------------------------------------------
+            # AUTO TITLE
+            # ------------------------------------------------
 
+            if first_user_message:
 
-        display_sources(
-            sources
-        )
+                update_conversation_title(
+                    conversation_id,
+                    generate_title(
+                        rag_prompt
+                    ),
+                )
 
+            # ------------------------------------------------
+            # SAVE USER
+            # ------------------------------------------------
 
-        # ====================================================
-        # ANSWER
-        # ====================================================
-
-        st.markdown(
-            content
-        )
-
-
-# ============================================================
-# CHAT INPUT
-# ============================================================
-
-typed_prompt = st.chat_input(
-    "Message Anil AI..."
-)
-
-
-prompt = (
-
-    st.session_state
-    .suggested_prompt
-
-    or
-
-    typed_prompt
-)
-
-
-if (
-    st.session_state
-    .suggested_prompt
-):
-
-    st.session_state.suggested_prompt = None
-
-
-# ============================================================
-# PROCESS USER REQUEST
-# ============================================================
-
-if prompt:
-
-    # ========================================================
-    # USER MESSAGE
-    # ========================================================
-
-    st.session_state.messages.append(
-        {
-            "role":
+            save_message(
+                conversation_id,
                 "user",
-
-            "content":
-                prompt
-        }
-    )
-
-
-    with st.chat_message(
-        "user",
-        avatar="👤"
-    ):
-
-        st.markdown(
-            prompt
-        )
-
-
-    # ========================================================
-    # ASSISTANT
-    # ========================================================
-
-    with st.chat_message(
-        "assistant",
-        avatar="🤖"
-    ):
-
-        response = ""
-
-        tools_used = []
-
-
-        try:
-
-            # =================================================
-            # ACTIVE DOCUMENT
-            # =================================================
-
-            active_document = None
-
-
-            if st.session_state.document:
-
-                active_document = (
-                    st.session_state
-                    .document["name"]
-                )
-
-
-            # =================================================
-            # RUN AGENT
-            # =================================================
-
-            with st.status(
-                "Thinking...",
-                expanded=False
-            ) as agent_status:
-
-
-                result = ask_llm(
-
-                    st.session_state.messages,
-
-                    active_document=
-                        active_document
-                )
-
-
-                response = (
-                    result.get(
-                        "content",
-                        ""
-                    )
-                )
-
-
-                tools_used = (
-                    result.get(
-                        "tools",
-                        []
-                    )
-                )
-
-
-                agent_status.update(
-
-                    label=
-                        "Done",
-
-                    state=
-                        "complete",
-
-                    expanded=
-                        False
-                )
-
-
-            # =================================================
-            # TOOL EVENTS
-            # =================================================
-
-            for tool in tools_used:
-
-                display_tool_event(
-                    tool
-                )
-
-
-            # =================================================
-            # SOURCES
-            # =================================================
-
-            sources = extract_kb_sources(
-                tools_used
+                rag_prompt,
             )
 
+            # ------------------------------------------------
+            # DISPLAY USER
+            # ------------------------------------------------
 
-            display_sources(
-                sources
-            )
-
-
-            # =================================================
-            # FALLBACK
-            # =================================================
-
-            if not response:
-
-                response = (
-                    "I completed the request, "
-                    "but no response was generated."
-                )
-
-
-            # =================================================
-            # ANSWER
-            # =================================================
-
-            st.markdown(
-                response
-            )
-
-
-        except Exception as error:
-
-            response = (
-                "Something went wrong while "
-                "processing your request."
-            )
-
-
-            tools_used = []
-
-
-            st.error(
-                response
-            )
-
-
-            with st.expander(
-                "Developer details"
+            with st.chat_message(
+                "user"
             ):
 
-                st.exception(
-                    error
+                st.markdown(
+                    rag_prompt
                 )
 
+            # ------------------------------------------------
+            # HYBRID RETRIEVAL
+            # ------------------------------------------------
 
-    # ========================================================
-    # SAVE ASSISTANT MESSAGE
-    # ========================================================
+            with st.spinner(
+                "Searching the document..."
+            ):
 
-    st.session_state.messages.append(
-        {
-            "role":
+                rag_result = (
+                    knowledge_base_search(
+                        query=rag_prompt
+                    )
+                )
+
+            sources = (
+                rag_result.get(
+                    "sources",
+                    [],
+                )
+                if isinstance(
+                    rag_result,
+                    dict,
+                )
+                else []
+            )
+
+            # ------------------------------------------------
+            # PREVIOUS RAG HISTORY
+            # ------------------------------------------------
+
+            rag_history = (
+                get_messages(
+                    conversation_id
+                )
+            )
+
+            # Current user question is passed separately
+            # to ask_rag, so exclude it from history.
+            previous_history = (
+                rag_history[:-1]
+            )
+
+            # ------------------------------------------------
+            # GENERATE DOCUMENT-GROUNDED RESPONSE
+            # ------------------------------------------------
+
+            with st.chat_message(
+                "assistant"
+            ):
+
+                with st.spinner(
+                    "Generating grounded answer..."
+                ):
+
+                    result = ask_rag(
+                        question=rag_prompt,
+                        rag_result=rag_result,
+                        rag_history=previous_history,
+                    )
+
+                answer = result.get(
+                    "content",
+                    "",
+                )
+
+                metrics = result.get(
+                    "metrics",
+                    {},
+                )
+
+                st.markdown(
+                    answer
+                )
+
+                display_rag_activity(
+                    sources,
+                    metrics,
+                )
+
+            # ------------------------------------------------
+            # SAVE RAG RESPONSE
+            # ------------------------------------------------
+
+            save_message(
+                conversation_id,
                 "assistant",
+                answer,
+                sources=sources,
+                metrics=metrics,
+            )
 
-            "content":
-                response,
-
-            "tools":
-                tools_used
-        }
-    )
+            st.rerun()

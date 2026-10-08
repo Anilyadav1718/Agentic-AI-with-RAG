@@ -4,1419 +4,875 @@ import re
 import chromadb
 
 from pypdf import PdfReader
-
 from rank_bm25 import BM25Okapi
+from sentence_transformers import (
+    SentenceTransformer,
+)
 
-from sentence_transformers import SentenceTransformer
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
 
 CHROMA_PATH = "chroma_db"
 
-COLLECTION_NAME = "anil_ai_documents"
+COLLECTION_NAME = (
+    "nexor_ai_documents"
+)
 
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL = (
+    "all-MiniLM-L6-v2"
+)
 
-
-# Final number of chunks given to LLM
 FINAL_TOP_K = 3
 
-
-# Candidate pools before fusion
 SEMANTIC_CANDIDATES = 10
-
 KEYWORD_CANDIDATES = 10
 
-
-# Reciprocal Rank Fusion constant
 RRF_K = 60
 
+CHUNK_SIZE = 900
+CHUNK_OVERLAP = 150
 
-# ============================================================
-# EMBEDDING MODEL
-# ============================================================
 
-embedding_model = SentenceTransformer(
-    EMBEDDING_MODEL
+embedding_model = (
+    SentenceTransformer(
+        EMBEDDING_MODEL
+    )
 )
 
-
-# ============================================================
-# CHROMA CLIENT
-# ============================================================
-
-chroma_client = chromadb.PersistentClient(
-    path=CHROMA_PATH
+chroma_client = (
+    chromadb.PersistentClient(
+        path=CHROMA_PATH
+    )
 )
-
 
 collection = (
     chroma_client
     .get_or_create_collection(
         name=COLLECTION_NAME,
-
         metadata={
             "hnsw:space": "cosine"
-        }
+        },
     )
 )
 
-
-# ============================================================
-# ACTIVE DOCUMENT
-# ============================================================
 
 _active_document = None
 
 
 def set_active_document(
-    file_name: str
+    file_name,
 ):
-
     global _active_document
-
     _active_document = file_name
 
 
 def get_active_document():
-
     return _active_document
 
 
 def clear_active_document():
-
     global _active_document
-
     _active_document = None
 
 
-# ============================================================
-# TOKENIZATION
-# ============================================================
-
-def tokenize(
-    text: str
-):
-
+def tokenize(text):
     if not text:
         return []
-
 
     return re.findall(
-        r"[a-zA-Z0-9_]+",
-        text.lower()
+        r"\b\w+\b",
+        text.lower(),
     )
 
-
-# ============================================================
-# CHUNK TEXT
-# ============================================================
 
 def chunk_text(
-    text: str,
-    chunk_size: int = 900,
-    overlap: int = 150
+    text,
+    chunk_size=CHUNK_SIZE,
+    overlap=CHUNK_OVERLAP,
 ):
+    if not text:
+        return []
 
-    text = (
-        text
-        .replace("\x00", " ")
-        .strip()
-    )
-
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
 
     if not text:
         return []
 
-
     chunks = []
-
     start = 0
 
-    text_length = len(text)
-
-
-    while start < text_length:
-
+    while start < len(text):
         end = min(
             start + chunk_size,
-            text_length
+            len(text),
         )
 
-
-        chunk = (
-            text[start:end]
-            .strip()
-        )
-
+        chunk = text[
+            start:end
+        ].strip()
 
         if chunk:
+            chunks.append(chunk)
 
-            chunks.append(
-                chunk
-            )
-
-
-        if end >= text_length:
+        if end >= len(text):
             break
 
-
-        start = end - overlap
-
+        start = max(
+            end - overlap,
+            start + 1,
+        )
 
     return chunks
 
 
-# ============================================================
-# DELETE EXISTING DOCUMENT
-# ============================================================
-
-def delete_document(
-    file_name: str
-):
-
+def delete_document(file_name):
     try:
-
         collection.delete(
             where={
                 "file": file_name
             }
         )
 
-    except Exception:
+        return {
+            "success": True
+        }
 
-        pass
+    except Exception as error:
+        return {
+            "success": False,
+            "error": str(error),
+        }
 
-
-# ============================================================
-# PROCESS PDF
-# ============================================================
 
 def process_pdf(
-    pdf_path: str,
-    file_name: str
+    pdf_path,
+    file_name,
 ):
+    global _active_document
 
     try:
-
         reader = PdfReader(
             pdf_path
         )
 
-
-        total_pages = len(
-            reader.pages
-        )
-
-
-        if total_pages == 0:
-
+        if not reader.pages:
             return {
                 "success": False,
                 "error": (
-                    "The PDF contains no pages."
-                )
+                    "PDF contains no "
+                    "readable pages."
+                ),
             }
 
-
-        # Delete old index for same PDF
         delete_document(
             file_name
         )
 
-
         documents = []
-
         metadatas = []
-
         ids = []
 
+        readable_pages = 0
+        chunk_count = 0
 
-        # ====================================================
-        # READ PAGES
-        # ====================================================
-
-        for page_index, page in enumerate(
-            reader.pages
+        for page_number, page in enumerate(
+            reader.pages,
+            start=1,
         ):
-
             try:
-
-                page_text = (
+                text = (
                     page.extract_text()
                     or ""
                 )
-
             except Exception:
+                text = ""
 
-                page_text = ""
+            text = text.strip()
 
-
-            if not page_text.strip():
-
+            if not text:
                 continue
 
+            readable_pages += 1
 
-            page_number = (
-                page_index + 1
+            chunks = chunk_text(
+                text
             )
-
-
-            page_chunks = chunk_text(
-                page_text
-            )
-
-
-            # =================================================
-            # CREATE CHUNKS
-            # =================================================
 
             for chunk_index, chunk in enumerate(
-                page_chunks
+                chunks
             ):
-
-                raw_id = (
-                    f"{file_name}-"
-                    f"{page_number}-"
-                    f"{chunk_index}-"
+                unique_string = (
+                    f"{file_name}:"
+                    f"{page_number}:"
+                    f"{chunk_index}:"
                     f"{chunk}"
                 )
 
-
                 chunk_id = (
-                    hashlib
-                    .sha256(
-                        raw_id.encode(
+                    hashlib.sha256(
+                        unique_string.encode(
                             "utf-8"
                         )
-                    )
-                    .hexdigest()
+                    ).hexdigest()
                 )
-
 
                 documents.append(
                     chunk
                 )
 
-
                 metadatas.append(
                     {
-                        "file":
-                            file_name,
-
-                        "page":
-                            page_number,
-
-                        "chunk":
-                            chunk_index,
-
-                        "chunk_id":
-                            chunk_id
+                        "file": file_name,
+                        "page": page_number,
+                        "chunk": chunk_index,
                     }
                 )
-
 
                 ids.append(
                     chunk_id
                 )
 
-
-        # ====================================================
-        # CHECK CONTENT
-        # ====================================================
+                chunk_count += 1
 
         if not documents:
-
             return {
                 "success": False,
                 "error": (
                     "No readable text was "
                     "found in the PDF."
-                )
+                ),
             }
 
-
-        print(
-            "\n===================================="
-        )
-
-        print(
-            "🧠 GENERATING EMBEDDINGS"
-        )
-
-        print(
-            "===================================="
-        )
-
-
-        # ====================================================
-        # GENERATE EMBEDDINGS
-        # ====================================================
-
         embeddings = (
-            embedding_model
-            .encode(
+            embedding_model.encode(
                 documents,
-                show_progress_bar=False,
-                normalize_embeddings=True
+                normalize_embeddings=True,
             )
             .tolist()
         )
 
+        collection.add(
+            ids=ids,
+            documents=documents,
+            embeddings=embeddings,
+            metadatas=metadatas,
+        )
 
-        # ====================================================
-        # STORE IN CHROMA
-        # ====================================================
-
-        batch_size = 100
-
-
-        for start in range(
-            0,
-            len(documents),
-            batch_size
-        ):
-
-            end = start + batch_size
-
-
-            collection.add(
-
-                ids=
-                    ids[start:end],
-
-                documents=
-                    documents[start:end],
-
-                metadatas=
-                    metadatas[start:end],
-
-                embeddings=
-                    embeddings[start:end]
-            )
-
-
-        set_active_document(
+        _active_document = (
             file_name
         )
-
-
-        print(
-            "\n===================================="
-        )
-
-        print(
-            "📚 PDF INDEXED"
-        )
-
-        print(
-            "===================================="
-        )
-
-        print(
-            f"File: {file_name}"
-        )
-
-        print(
-            f"Pages: {total_pages}"
-        )
-
-        print(
-            f"Chunks: {len(documents)}"
-        )
-
 
         return {
             "success": True,
             "file": file_name,
-            "pages": total_pages,
-            "chunks": len(documents)
+            "pages": readable_pages,
+            "chunks": chunk_count,
         }
-
 
     except Exception as error:
-
-        print(
-            f"❌ PDF ERROR: {error}"
-        )
-
-
         return {
             "success": False,
-            "error": str(error)
+            "error": str(error),
         }
 
 
-# ============================================================
-# GET ALL DOCUMENT CHUNKS
-# ============================================================
-
 def get_document_chunks(
-    file_name: str
+    file_name,
 ):
-
     try:
-
-        results = collection.get(
-
+        result = collection.get(
             where={
                 "file": file_name
             },
-
             include=[
                 "documents",
-                "metadatas"
-            ]
+                "metadatas",
+            ],
         )
-
 
         documents = (
-            results.get(
+            result.get(
                 "documents",
-                []
+                [],
             )
             or []
         )
-
 
         metadatas = (
-            results.get(
+            result.get(
                 "metadatas",
-                []
+                [],
             )
             or []
         )
-
 
         ids = (
-            results.get(
+            result.get(
                 "ids",
-                []
+                [],
             )
             or []
         )
-
 
         chunks = []
 
-
         for index, document in enumerate(
             documents
         ):
-
             metadata = (
-
                 metadatas[index]
-
                 if index < len(
                     metadatas
                 )
-
                 else {}
             )
 
-
             chunk_id = (
-
                 ids[index]
-
                 if index < len(ids)
-
-                else metadata.get(
-                    "chunk_id"
-                )
+                else str(index)
             )
-
 
             chunks.append(
                 {
-                    "id":
-                        chunk_id,
-
-                    "text":
-                        document,
-
-                    "page":
-                        metadata.get(
-                            "page",
-                            "?"
-                        ),
-
-                    "file":
+                    "id": chunk_id,
+                    "text": document,
+                    "file": (
                         metadata.get(
                             "file",
-                            file_name
+                            file_name,
                         )
+                    ),
+                    "page": (
+                        metadata.get(
+                            "page",
+                            "?",
+                        )
+                    ),
+                    "chunk": (
+                        metadata.get(
+                            "chunk",
+                            index,
+                        )
+                    ),
                 }
             )
-
 
         return chunks
 
-
-    except Exception as error:
-
-        print(
-            f"❌ Chunk loading error: "
-            f"{error}"
-        )
-
+    except Exception:
         return []
 
-
-# ============================================================
-# SEMANTIC SEARCH
-# ============================================================
 
 def semantic_search(
-    query: str,
-    file_name: str,
-    top_k: int = SEMANTIC_CANDIDATES
+    query,
+    file_name,
+    top_k=SEMANTIC_CANDIDATES,
 ):
+    chunks = get_document_chunks(
+        file_name
+    )
 
-    try:
-
-        # ====================================================
-        # QUERY EMBEDDING
-        # ====================================================
-
-        query_embedding = (
-            embedding_model
-            .encode(
-                [query],
-                show_progress_bar=False,
-                normalize_embeddings=True
-            )
-            .tolist()
-        )
-
-
-        # ====================================================
-        # VECTOR SEARCH
-        # ====================================================
-
-        results = collection.query(
-
-            query_embeddings=
-                query_embedding,
-
-            n_results=
-                top_k,
-
-            where={
-                "file": file_name
-            },
-
-            include=[
-                "documents",
-                "metadatas",
-                "distances"
-            ]
-        )
-
-
-        if (
-            not results.get(
-                "documents"
-            )
-            or
-            not results[
-                "documents"
-            ][0]
-        ):
-
-            return []
-
-
-        documents = (
-            results[
-                "documents"
-            ][0]
-        )
-
-
-        metadatas = (
-            results[
-                "metadatas"
-            ][0]
-        )
-
-
-        distances = (
-            results[
-                "distances"
-            ][0]
-        )
-
-
-        ids = (
-            results[
-                "ids"
-            ][0]
-        )
-
-
-        semantic_results = []
-
-
-        # ====================================================
-        # BUILD RESULTS
-        # ====================================================
-
-        for index, document in enumerate(
-            documents
-        ):
-
-            metadata = (
-                metadatas[index]
-            )
-
-
-            distance = float(
-                distances[index]
-            )
-
-
-            # Cosine similarity
-            semantic_score = (
-                1.0 - distance
-            )
-
-
-            semantic_score = max(
-                0.0,
-                min(
-                    semantic_score,
-                    1.0
-                )
-            )
-
-
-            semantic_results.append(
-                {
-                    "id":
-                        ids[index],
-
-                    "text":
-                        document,
-
-                    "page":
-                        metadata.get(
-                            "page",
-                            "?"
-                        ),
-
-                    "file":
-                        metadata.get(
-                            "file",
-                            file_name
-                        ),
-
-                    "semantic_score":
-                        semantic_score,
-
-                    "semantic_rank":
-                        index + 1
-                }
-            )
-
-
-        return semantic_results
-
-
-    except Exception as error:
-
-        print(
-            f"❌ Semantic search error: "
-            f"{error}"
-        )
-
+    if not chunks:
         return []
 
+    top_k = min(
+        top_k,
+        len(chunks),
+    )
 
-# ============================================================
-# KEYWORD / BM25 SEARCH
-# ============================================================
+    query_embedding = (
+        embedding_model.encode(
+            [query],
+            normalize_embeddings=True,
+        )
+        .tolist()[0]
+    )
+
+    result = collection.query(
+        query_embeddings=[
+            query_embedding
+        ],
+        n_results=top_k,
+        where={
+            "file": file_name
+        },
+        include=[
+            "documents",
+            "metadatas",
+            "distances",
+        ],
+    )
+
+    documents = (
+        result.get(
+            "documents",
+            [[]],
+        )[0]
+        or []
+    )
+
+    metadatas = (
+        result.get(
+            "metadatas",
+            [[]],
+        )[0]
+        or []
+    )
+
+    distances = (
+        result.get(
+            "distances",
+            [[]],
+        )[0]
+        or []
+    )
+
+    ids = (
+        result.get(
+            "ids",
+            [[]],
+        )[0]
+        or []
+    )
+
+    results = []
+
+    for rank, document in enumerate(
+        documents,
+        start=1,
+    ):
+        index = rank - 1
+
+        distance = (
+            distances[index]
+            if index < len(
+                distances
+            )
+            else 1.0
+        )
+
+        similarity = max(
+            0.0,
+            min(
+                1.0,
+                1.0 - float(
+                    distance
+                ),
+            ),
+        )
+
+        metadata = (
+            metadatas[index]
+            if index < len(
+                metadatas
+            )
+            else {}
+        )
+
+        results.append(
+            {
+                "id": (
+                    ids[index]
+                    if index < len(ids)
+                    else str(index)
+                ),
+                "text": document,
+                "file": (
+                    metadata.get(
+                        "file",
+                        file_name,
+                    )
+                ),
+                "page": (
+                    metadata.get(
+                        "page",
+                        "?",
+                    )
+                ),
+                "chunk": (
+                    metadata.get(
+                        "chunk",
+                        index,
+                    )
+                ),
+                "semantic_rank": rank,
+                "semantic_relevance": (
+                    round(
+                        similarity * 100,
+                        2,
+                    )
+                ),
+            }
+        )
+
+    return results
+
 
 def keyword_search(
-    query: str,
-    file_name: str,
-    top_k: int = KEYWORD_CANDIDATES
+    query,
+    file_name,
+    top_k=KEYWORD_CANDIDATES,
 ):
+    chunks = get_document_chunks(
+        file_name
+    )
 
-    try:
-
-        chunks = get_document_chunks(
-            file_name
-        )
-
-
-        if not chunks:
-
-            return []
-
-
-        # ====================================================
-        # TOKENIZE DOCUMENT
-        # ====================================================
-
-        tokenized_corpus = [
-
-            tokenize(
-                chunk["text"]
-            )
-
-            for chunk in chunks
-        ]
-
-
-        # ====================================================
-        # BM25
-        # ====================================================
-
-        bm25 = BM25Okapi(
-            tokenized_corpus
-        )
-
-
-        query_tokens = tokenize(
-            query
-        )
-
-
-        if not query_tokens:
-
-            return []
-
-
-        scores = bm25.get_scores(
-            query_tokens
-        )
-
-
-        keyword_results = []
-
-
-        # ====================================================
-        # SCORE EACH CHUNK
-        # ====================================================
-
-        for index, score in enumerate(
-            scores
-        ):
-
-            if float(score) <= 0:
-                continue
-
-
-            keyword_results.append(
-                {
-                    **chunks[index],
-
-                    "keyword_score":
-                        float(score)
-                }
-            )
-
-
-        # ====================================================
-        # SORT
-        # ====================================================
-
-        keyword_results.sort(
-
-            key=lambda item:
-                item[
-                    "keyword_score"
-                ],
-
-            reverse=True
-        )
-
-
-        keyword_results = (
-            keyword_results[
-                :top_k
-            ]
-        )
-
-
-        # ====================================================
-        # RANK
-        # ====================================================
-
-        for index, result in enumerate(
-            keyword_results,
-            start=1
-        ):
-
-            result[
-                "keyword_rank"
-            ] = index
-
-
-        return keyword_results
-
-
-    except Exception as error:
-
-        print(
-            f"❌ BM25 search error: "
-            f"{error}"
-        )
-
+    if not chunks:
         return []
 
+    query_tokens = tokenize(
+        query
+    )
 
-# ============================================================
-# RECIPROCAL RANK FUSION
-# ============================================================
+    if not query_tokens:
+        return []
+
+    tokenized_corpus = [
+        tokenize(
+            chunk["text"]
+        )
+        for chunk in chunks
+    ]
+
+    bm25 = BM25Okapi(
+        tokenized_corpus
+    )
+
+    scores = bm25.get_scores(
+        query_tokens
+    )
+
+    ranked_indexes = sorted(
+        range(len(scores)),
+        key=lambda index: (
+            scores[index]
+        ),
+        reverse=True,
+    )
+
+    results = []
+
+    for index in ranked_indexes:
+        score = float(
+            scores[index]
+        )
+
+        if score <= 0:
+            continue
+
+        chunk = chunks[index]
+
+        results.append(
+            {
+                **chunk,
+                "keyword_score": (
+                    round(
+                        score,
+                        4,
+                    )
+                ),
+            }
+        )
+
+        if len(results) >= top_k:
+            break
+
+    for rank, result in enumerate(
+        results,
+        start=1,
+    ):
+        result[
+            "keyword_rank"
+        ] = rank
+
+    return results
+
 
 def reciprocal_rank_fusion(
     semantic_results,
     keyword_results,
-    top_k: int = FINAL_TOP_K
 ):
-
     fused = {}
-
-
-    # ========================================================
-    # SEMANTIC RESULTS
-    # ========================================================
 
     for rank, result in enumerate(
         semantic_results,
-        start=1
+        start=1,
     ):
-
-        chunk_id = result[
-            "id"
-        ]
-
+        chunk_id = result["id"]
 
         if chunk_id not in fused:
-
-            fused[
-                chunk_id
-            ] = {
-
-                "id":
-                    chunk_id,
-
-                "text":
-                    result["text"],
-
-                "page":
-                    result["page"],
-
-                "file":
-                    result["file"],
-
-                "semantic_score":
-                    result.get(
-                        "semantic_score",
-                        0
-                    ),
-
-                "keyword_score":
-                    0.0,
-
-                "semantic_rank":
-                    rank,
-
-                "keyword_rank":
-                    None,
-
-                "rrf_score":
-                    0.0
+            fused[chunk_id] = {
+                **result,
+                "rrf_score": 0.0,
+                "keyword_score": 0.0,
+                "semantic_present": False,
+                "keyword_present": False,
             }
 
+        fused[chunk_id][
+            "semantic_present"
+        ] = True
 
-        fused[
-            chunk_id
-        ][
-            "rrf_score"
-        ] += (
+        fused[chunk_id][
+            "semantic_rank"
+        ] = rank
 
-            1.0
-            /
-            (
-                RRF_K
-                + rank
-            )
+        fused[chunk_id][
+            "semantic_relevance"
+        ] = result.get(
+            "semantic_relevance",
+            0,
         )
 
-
-    # ========================================================
-    # KEYWORD RESULTS
-    # ========================================================
+        fused[chunk_id][
+            "rrf_score"
+        ] += (
+            1.0
+            / (
+                RRF_K + rank
+            )
+        )
 
     for rank, result in enumerate(
         keyword_results,
-        start=1
+        start=1,
     ):
-
-        chunk_id = result[
-            "id"
-        ]
-
+        chunk_id = result["id"]
 
         if chunk_id not in fused:
-
-            fused[
-                chunk_id
-            ] = {
-
-                "id":
-                    chunk_id,
-
-                "text":
-                    result["text"],
-
-                "page":
-                    result["page"],
-
-                "file":
-                    result["file"],
-
-                "semantic_score":
-                    0.0,
-
-                "keyword_score":
-                    result.get(
-                        "keyword_score",
-                        0
-                    ),
-
-                "semantic_rank":
-                    None,
-
-                "keyword_rank":
-                    rank,
-
-                "rrf_score":
-                    0.0
+            fused[chunk_id] = {
+                **result,
+                "rrf_score": 0.0,
+                "semantic_relevance": 0.0,
+                "semantic_present": False,
+                "keyword_present": False,
             }
 
+        fused[chunk_id][
+            "keyword_present"
+        ] = True
 
-        else:
+        fused[chunk_id][
+            "keyword_rank"
+        ] = rank
 
-            fused[
-                chunk_id
-            ][
-                "keyword_score"
-            ] = result.get(
-                "keyword_score",
-                0
-            )
+        fused[chunk_id][
+            "keyword_score"
+        ] = result.get(
+            "keyword_score",
+            0,
+        )
 
-
-            fused[
-                chunk_id
-            ][
-                "keyword_rank"
-            ] = rank
-
-
-        fused[
-            chunk_id
-        ][
+        fused[chunk_id][
             "rrf_score"
         ] += (
-
             1.0
-            /
-            (
-                RRF_K
-                + rank
+            / (
+                RRF_K + rank
             )
         )
 
-
-    # ========================================================
-    # SORT FUSED RESULTS
-    # ========================================================
-
-    final_results = list(
-        fused.values()
+    ranked = sorted(
+        fused.values(),
+        key=lambda item: (
+            item["rrf_score"]
+        ),
+        reverse=True,
     )
 
+    final_results = ranked[
+        :FINAL_TOP_K
+    ]
 
-    final_results.sort(
+    if not final_results:
+        return []
 
-        key=lambda item:
-            item[
-                "rrf_score"
-            ],
-
-        reverse=True
+    max_rrf = max(
+        item["rrf_score"]
+        for item in final_results
     )
-
-
-    final_results = (
-        final_results[
-            :top_k
-        ]
-    )
-
-
-    # ========================================================
-    # DISPLAY RELEVANCE
-    # ========================================================
-
-    if final_results:
-
-        max_rrf = max(
-
-            item[
-                "rrf_score"
-            ]
-
-            for item in final_results
-        )
-
-    else:
-
-        max_rrf = 0
-
 
     for result in final_results:
-
-        # ====================================================
-        # HYBRID RELEVANCE
-        #
-        # Relative RRF score for UI.
-        # NOT probability/confidence.
-        # ====================================================
-
-        if max_rrf > 0:
-
-            hybrid_score = (
-
-                result[
-                    "rrf_score"
-                ]
-
-                / max_rrf
-            )
-
-        else:
-
-            hybrid_score = 0
-
-
-        result[
-            "hybrid_relevance"
-        ] = round(
-            hybrid_score * 100,
-            1
-        )
-
-
-        # ====================================================
-        # SEMANTIC RELEVANCE
-        # ====================================================
-
-        result[
-            "semantic_relevance"
-        ] = round(
-
+        semantic_present = (
             result.get(
-                "semantic_score",
-                0
+                "semantic_present",
+                False,
             )
-            * 100,
-
-            1
         )
 
-
-        # ====================================================
-        # MATCH TYPE
-        # ====================================================
-
-        has_semantic = (
+        keyword_present = (
             result.get(
-                "semantic_rank"
+                "keyword_present",
+                False,
             )
-            is not None
         )
-
-
-        has_keyword = (
-            result.get(
-                "keyword_rank"
-            )
-            is not None
-        )
-
 
         if (
-            has_semantic
-            and
-            has_keyword
+            semantic_present
+            and keyword_present
         ):
-
             match_type = (
                 "Semantic + Keyword"
             )
 
-        elif has_semantic:
-
-            match_type = (
-                "Semantic"
-            )
+        elif semantic_present:
+            match_type = "Semantic"
 
         else:
-
-            match_type = (
-                "Keyword"
-            )
-
+            match_type = "Keyword"
 
         result[
             "match_type"
         ] = match_type
 
+        result[
+            "relevance"
+        ] = round(
+            (
+                result["rrf_score"]
+                / max_rrf
+            )
+            * 100,
+            2,
+        )
 
     return final_results
 
 
-# ============================================================
-# HYBRID SEARCH
-# ============================================================
-
 def hybrid_search(
-    query: str,
-    file_name: str,
-    top_k: int = FINAL_TOP_K
+    query,
+    file_name,
 ):
-
-    print(
-        "\n===================================="
-    )
-
-    print(
-        "🔎 HYBRID SEARCH"
-    )
-
-    print(
-        "===================================="
-    )
-
-    print(
-        f"Query: {query}"
-    )
-
-
-    # ========================================================
-    # SEMANTIC
-    # ========================================================
-
     semantic_results = (
         semantic_search(
-
-            query=query,
-
-            file_name=file_name,
-
-            top_k=SEMANTIC_CANDIDATES
+            query,
+            file_name,
         )
     )
-
-
-    print(
-        f"🧠 Semantic candidates: "
-        f"{len(semantic_results)}"
-    )
-
-
-    # ========================================================
-    # KEYWORD
-    # ========================================================
 
     keyword_results = (
         keyword_search(
-
-            query=query,
-
-            file_name=file_name,
-
-            top_k=KEYWORD_CANDIDATES
+            query,
+            file_name,
         )
     )
 
-
-    print(
-        f"🔤 BM25 candidates: "
-        f"{len(keyword_results)}"
+    return reciprocal_rank_fusion(
+        semantic_results,
+        keyword_results,
     )
 
-
-    # ========================================================
-    # FUSION
-    # ========================================================
-
-    final_results = (
-        reciprocal_rank_fusion(
-
-            semantic_results=
-                semantic_results,
-
-            keyword_results=
-                keyword_results,
-
-            top_k=
-                top_k
-        )
-    )
-
-
-    print(
-        "\n🏆 TOP HYBRID RESULTS"
-    )
-
-
-    for index, result in enumerate(
-        final_results,
-        start=1
-    ):
-
-        print(
-            f"{index}. "
-            f"Page {result['page']} | "
-            f"Hybrid {result['hybrid_relevance']}% | "
-            f"Semantic {result['semantic_relevance']}% | "
-            f"BM25 {result['keyword_score']:.3f} | "
-            f"{result['match_type']}"
-        )
-
-
-    return final_results
-
-
-# ============================================================
-# KNOWLEDGE BASE TOOL
-# ============================================================
 
 def knowledge_base_search(
-    query: str
+    query: str,
 ):
-
     file_name = (
         get_active_document()
     )
 
-
     if not file_name:
-
         return {
             "success": False,
             "error": (
-                "No uploaded PDF knowledge "
-                "base is currently active."
-            )
+                "No PDF is active. "
+                "Upload a PDF first."
+            ),
+            "sources": [],
         }
 
-
-    # ========================================================
-    # HYBRID RETRIEVAL
-    # ========================================================
-
-    results = hybrid_search(
-
-        query=query,
-
-        file_name=file_name,
-
-        top_k=FINAL_TOP_K
-    )
-
-
-    if not results:
-
+    if not query or not query.strip():
         return {
             "success": False,
-
-            "document":
-                file_name,
-
-            "error":
-                (
-                    "No relevant information "
-                    "was found in the document."
-                )
+            "error": (
+                "Knowledge base query "
+                "cannot be empty."
+            ),
+            "sources": [],
         }
 
-
-    # ========================================================
-    # SOURCES
-    # ========================================================
-
-    sources = []
-
-
-    for result in results:
-
-        sources.append(
-            {
-                "file":
-                    result["file"],
-
-                "page":
-                    result["page"],
-
-                "text":
-                    result["text"],
-
-                "relevance":
-                    result[
-                        "hybrid_relevance"
-                    ],
-
-                "semantic_relevance":
-                    result[
-                        "semantic_relevance"
-                    ],
-
-                "keyword_score":
-                    round(
-                        result[
-                            "keyword_score"
-                        ],
-                        3
-                    ),
-
-                "match_type":
-                    result[
-                        "match_type"
-                    ],
-
-                "retrieval":
-                    "hybrid"
-            }
+    try:
+        results = hybrid_search(
+            query.strip(),
+            file_name,
         )
 
+        sources = []
 
-    return {
-        "success": True,
+        for result in results:
+            sources.append(
+                {
+                    "file": result.get(
+                        "file",
+                        file_name,
+                    ),
+                    "page": result.get(
+                        "page",
+                        "?",
+                    ),
+                    "text": result.get(
+                        "text",
+                        "",
+                    ),
+                    "relevance": (
+                        result.get(
+                            "relevance",
+                            0,
+                        )
+                    ),
+                    "semantic_relevance": (
+                        result.get(
+                            "semantic_relevance",
+                            0,
+                        )
+                    ),
+                    "keyword_score": (
+                        result.get(
+                            "keyword_score",
+                            0,
+                        )
+                    ),
+                    "match_type": (
+                        result.get(
+                            "match_type",
+                            "Hybrid",
+                        )
+                    ),
+                    "retrieval": "hybrid",
+                }
+            )
 
-        "query":
-            query,
+        if not sources:
+            return {
+                "success": False,
+                "query": query,
+                "document": file_name,
+                "error": (
+                    "No relevant content "
+                    "was found in the "
+                    "uploaded document."
+                ),
+                "sources": [],
+            }
 
-        "document":
-            file_name,
+        return {
+            "success": True,
+            "query": query,
+            "document": file_name,
+            "search_type": "hybrid",
+            "retrieved": len(
+                sources
+            ),
+            "sources": sources,
+        }
 
-        "search_type":
-            "hybrid",
-
-        "retrieved":
-            len(sources),
-
-        "sources":
-            sources
-    }
+    except Exception as error:
+        return {
+            "success": False,
+            "query": query,
+            "document": file_name,
+            "error": str(error),
+            "sources": [],
+        }

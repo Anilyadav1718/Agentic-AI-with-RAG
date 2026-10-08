@@ -1,33 +1,37 @@
 from ddgs import DDGS
 
 
+MAX_WEB_RESULTS = 3
+
+
 def web_search(
     query: str,
-    max_results: int = 3
+    max_results: int = MAX_WEB_RESULTS,
 ):
-    """
-    Search the web using DDGS.
-
-    The number of results is intentionally limited
-    to reduce the amount of context sent back to the LLM.
-    """
-
     if not query or not query.strip():
         return {
             "success": False,
-            "error": "Search query cannot be empty."
+            "error": "Search query cannot be empty.",
+            "results": [],
         }
 
-    # Keep results small to reduce LLM token usage
-    max_results = min(
-        max(max_results, 1),
-        3
+    try:
+        max_results = int(max_results)
+    except (TypeError, ValueError):
+        max_results = MAX_WEB_RESULTS
+
+    max_results = max(
+        1,
+        min(
+            max_results,
+            MAX_WEB_RESULTS,
+        ),
     )
 
     try:
         raw_results = DDGS().text(
-            query,
-            max_results=max_results
+            query.strip(),
+            max_results=max_results,
         )
 
         results = []
@@ -37,27 +41,38 @@ def web_search(
                 {
                     "title": item.get(
                         "title",
-                        ""
+                        "",
                     ),
                     "url": item.get(
                         "href",
-                        ""
+                        "",
                     ),
                     "snippet": item.get(
                         "body",
-                        ""
-                    )
+                        "",
+                    ),
                 }
             )
+
+        if not results:
+            return {
+                "success": False,
+                "query": query,
+                "error": "No search results found.",
+                "results": [],
+            }
 
         return {
             "success": True,
             "query": query,
-            "results": results
+            "count": len(results),
+            "results": results,
         }
 
     except Exception as error:
         return {
             "success": False,
-            "error": str(error)
+            "query": query,
+            "error": str(error),
+            "results": [],
         }

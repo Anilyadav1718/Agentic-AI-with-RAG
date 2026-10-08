@@ -3,6 +3,7 @@ import tempfile
 
 import streamlit as st
 
+# pyrefly: ignore [missing-import]
 from llm import ask_llm
 
 from rag.document_rag import (
@@ -154,15 +155,12 @@ footer {
 
 with st.sidebar:
 
-    st.title(
-        "🤖 Anil AI"
-    )
-
+    st.title("🤖⚡ Nexora AI")
 
     st.caption(
-        "Agentic AI Workspace"
+        "Agentic AI assistant powered by tool calling, "
+        "real-time web search, and Hybrid RAG."
     )
-
 
     # ========================================================
     # NEW CHAT

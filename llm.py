@@ -8,267 +8,66 @@ from groq import Groq
 
 # pyrefly: ignore [missing-import]
 from tools.registry import execute_tool
+from rag.document_rag import get_active_document
 
 
-# Local development
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+MODEL_NAME = "qwen/qwen3.8-27b"
+
+# Keep this low because the current Groq tier/model
+# has a small output-tokens-per-minute limit.
+MAX_OUTPUT_TOKENS = 300
+
+# Maximum number of agent/tool steps for one request.
+MAX_STEPS = 5
+
+
+# ============================================================
+# API KEY
+# ============================================================
+
+# Local development:
+# Load variables from .env if the file exists.
 load_dotenv()
 
+GROQ_API_KEY = os.getenv(
+    "GROQ_API_KEY"
+)
 
-# First try local .env
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-
-# If running on Streamlit Cloud,
-# try Streamlit Secrets
+# Streamlit Community Cloud:
+# If .env/environment variable is unavailable,
+# try Streamlit App Secrets.
 if not GROQ_API_KEY:
+
     try:
-        GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+        GROQ_API_KEY = st.secrets[
+            "GROQ_API_KEY"
+        ]
+
     except Exception:
         GROQ_API_KEY = None
 
 
 if not GROQ_API_KEY:
+
     raise ValueError(
         "GROQ_API_KEY is not configured. "
-        "For local development add it to .env. "
-        "For Streamlit Cloud add it to App Secrets."
+        "Add it to .env for local development "
+        "or Streamlit App Secrets for deployment."
     )
 
+
+# ============================================================
+# GROQ CLIENT
+# ============================================================
 
 client = Groq(
     api_key=GROQ_API_KEY
 )
-
-
-MODEL_NAME = "qwen/qwen3.8-27b"
-# ============================================================
-# SYSTEM PROMPT
-# ============================================================
-
-SYSTEM_PROMPT = """
-You are Anil AI, a helpful Agentic AI assistant.
-
-You have three tools:
-
-1. calculator
-2. web_search
-3. knowledge_base_search
-
-
-============================================================
-GENERAL BEHAVIOR
-============================================================
-
-Answer clearly and directly.
-
-Do not call tools when they are unnecessary.
-
-Never claim that a tool was used unless it was actually
-called.
-
-Use conversation history for follow-up questions.
-
-Do not expose internal reasoning or hidden chain-of-thought.
-
-
-============================================================
-CALCULATOR
-============================================================
-
-Use calculator when accurate arithmetic is required.
-
-Examples:
-
-"Calculate 937 * 47"
-
-"What is 900 divided by 13?"
-
-"Add 52 and 89"
-
-
-============================================================
-WEB SEARCH
-============================================================
-
-Use web_search when information needs to be current.
-
-Examples include:
-
-latest
-current
-today
-recent
-breaking
-live
-this week
-new announcement
-current company information
-
-Do not claim pretrained knowledge is current when a question
-clearly requires recent information.
-
-Summarize the useful information returned by web search.
-
-
-============================================================
-PDF KNOWLEDGE BASE
-============================================================
-
-Use knowledge_base_search when the user explicitly refers to:
-
-uploaded PDF
-uploaded document
-my PDF
-my document
-knowledge base
-according to the PDF
-according to the document
-from the uploaded PDF
-
-Do not automatically search the PDF merely because a PDF
-happens to be uploaded.
-
-Example:
-
-"Who is Virat Kohli?"
-
-Normally answer without PDF retrieval.
-
-Example:
-
-"According to my uploaded PDF, explain RAG."
-
-Use knowledge_base_search.
-
-
-============================================================
-HYBRID RETRIEVAL
-============================================================
-
-The knowledge base uses Hybrid Search.
-
-It combines:
-
-1. Semantic vector search
-2. BM25 keyword search
-3. Reciprocal Rank Fusion
-
-Semantic retrieval finds information with similar meaning.
-
-BM25 finds strong exact keyword and terminology matches.
-
-Reciprocal Rank Fusion combines both rankings.
-
-The final retrieval returns the top 3 chunks.
-
-
-============================================================
-RAG ANSWERING RULES
-============================================================
-
-When knowledge_base_search returns sources:
-
-1. Read all retrieved sources before answering.
-
-2. Answer the user's actual question directly.
-
-3. Synthesize the information into one coherent answer.
-
-4. Do not simply copy or list retrieved chunks.
-
-5. Combine overlapping evidence.
-
-6. Keep the explanation concise unless the user asks for
-   detail.
-
-7. Ground factual claims in the retrieved document.
-
-8. Do not invent information unsupported by the sources.
-
-9. Mention page numbers naturally when useful.
-
-10. Handle obvious spelling mistakes using context.
-
-For example:
-
-"reag"
-"ragg"
-"rag"
-
-may refer to RAG if the document evidence clearly discusses
-Retrieval-Augmented Generation.
-
-11. Do not reject a question merely because the user's term
-    contains a small typo.
-
-12. If the retrieved evidence genuinely does not contain
-    enough information, say:
-
-"I couldn't find enough relevant information in the uploaded
-document."
-
-13. Do not describe semantic search, BM25, chunks, embeddings
-    or RRF in the final answer unless the user asks how the
-    retrieval system works.
-
-
-============================================================
-RELEVANCE SCORES
-============================================================
-
-Sources may contain:
-
-relevance
-semantic_relevance
-keyword_score
-match_type
-
-These are retrieval-ranking signals.
-
-They are NOT probabilities that the final answer is correct.
-
-Do not describe them as answer-confidence probabilities.
-
-
-============================================================
-TOOL HISTORY
-============================================================
-
-Previous assistant messages may contain:
-
-[TOOLS USED FOR THIS RESPONSE]
-
-Treat this as the authoritative record of tools used in
-previous turns.
-
-If the user asks:
-
-"Which tool did you use?"
-
-Answer based only on that history.
-
-
-============================================================
-MULTI-STEP AGENT
-============================================================
-
-You may use multiple tool calls.
-
-For example:
-
-User:
-"Search for the current price of something and calculate
-the cost of 10."
-
-Possible workflow:
-
-web_search
-→ calculator
-→ final answer
-
-Stop calling tools once enough information has been gathered
-to answer the user.
-"""
 
 
 # ============================================================
@@ -277,233 +76,306 @@ to answer the user.
 
 TOOL_DEFINITIONS = [
 
-    # ========================================================
+    # --------------------------------------------------------
     # CALCULATOR
-    # ========================================================
+    # --------------------------------------------------------
 
     {
         "type": "function",
-
         "function": {
-
-            "name":
-                "calculator",
-
-            "description":
-                (
-                    "Perform accurate arithmetic "
-                    "calculations."
-                ),
-
+            "name": "calculator",
+            "description": (
+                "Perform basic arithmetic calculations. "
+                "Use this tool when the user asks to add, "
+                "subtract, multiply, or divide numbers."
+            ),
             "parameters": {
-
                 "type": "object",
-
                 "properties": {
 
                     "a": {
-
-                        "type":
-                            "number",
-
-                        "description":
-                            "First number."
+                        "type": "number",
+                        "description": "First number."
                     },
 
                     "b": {
-
-                        "type":
-                            "number",
-
-                        "description":
-                            "Second number."
+                        "type": "number",
+                        "description": "Second number."
                     },
 
                     "operation": {
-
-                        "type":
-                            "string",
-
+                        "type": "string",
                         "enum": [
                             "add",
                             "subtract",
                             "multiply",
                             "divide"
                         ],
-
-                        "description":
-                            (
-                                "Arithmetic operation "
-                                "to perform."
-                            )
+                        "description": (
+                            "Arithmetic operation."
+                        )
                     }
-                },
 
+                },
                 "required": [
                     "a",
                     "b",
                     "operation"
-                ]
+                ],
+                "additionalProperties": False
             }
         }
     },
 
 
-    # ========================================================
+    # --------------------------------------------------------
     # WEB SEARCH
-    # ========================================================
+    # --------------------------------------------------------
 
     {
         "type": "function",
-
         "function": {
-
-            "name":
-                "web_search",
-
-            "description":
-                (
-                    "Search the internet for "
-                    "current, recent, latest or "
-                    "time-sensitive information."
-                ),
-
+            "name": "web_search",
+            "description": (
+                "Search the public web for current or "
+                "recent information. Use this tool for "
+                "questions involving latest, today, "
+                "current, recent, live, news, prices, "
+                "events, or information that may have "
+                "changed after the model's training."
+            ),
             "parameters": {
-
                 "type": "object",
-
                 "properties": {
 
                     "query": {
-
-                        "type":
-                            "string",
-
-                        "description":
-                            (
-                                "Concise web "
-                                "search query."
-                            )
+                        "type": "string",
+                        "description": (
+                            "A concise web search query."
+                        )
                     },
 
                     "max_results": {
-
-                        "type":
-                            "integer",
-
-                        "minimum":
-                            1,
-
-                        "maximum":
-                            5,
-
-                        "description":
-                            (
-                                "Number of search "
-                                "results to retrieve."
-                            )
+                        "type": "integer",
+                        "description": (
+                            "Number of search results. "
+                            "Use 3 or fewer."
+                        ),
+                        "minimum": 1,
+                        "maximum": 3
                     }
-                },
 
+                },
                 "required": [
                     "query"
-                ]
+                ],
+                "additionalProperties": False
             }
         }
     },
 
 
-    # ========================================================
-    # HYBRID KNOWLEDGE SEARCH
-    # ========================================================
+    # --------------------------------------------------------
+    # KNOWLEDGE BASE / RAG
+    # --------------------------------------------------------
 
     {
         "type": "function",
-
         "function": {
-
-            "name":
-                "knowledge_base_search",
-
-            "description":
-                (
-                    "Search the currently uploaded "
-                    "PDF knowledge base using hybrid "
-                    "semantic vector search and BM25 "
-                    "keyword search."
-                ),
-
+            "name": "knowledge_base_search",
+            "description": (
+                "Search the currently uploaded PDF "
+                "knowledge base using hybrid retrieval. "
+                "Use this tool when the user explicitly "
+                "asks about their uploaded PDF, uploaded "
+                "document, uploaded file, knowledge base, "
+                "or asks what their document says."
+            ),
             "parameters": {
-
                 "type": "object",
-
                 "properties": {
 
                     "query": {
-
-                        "type":
-                            "string",
-
-                        "description":
-                            (
-                                "Concise search query "
-                                "for retrieving relevant "
-                                "information from the PDF."
-                            )
+                        "type": "string",
+                        "description": (
+                            "The question or search query "
+                            "for the uploaded document."
+                        )
                     }
-                },
 
+                },
                 "required": [
                     "query"
-                ]
+                ],
+                "additionalProperties": False
             }
         }
     }
+
 ]
 
 
 # ============================================================
-# BUILD MODEL HISTORY
+# SYSTEM PROMPT
+# ============================================================
+
+SYSTEM_PROMPT = """
+You are Nexora AI, an Agentic AI assistant with tool-calling
+and retrieval-augmented generation capabilities.
+
+You have access to three tools:
+
+1. calculator
+2. web_search
+3. knowledge_base_search
+
+
+TOOL ROUTING RULES
+
+Use calculator when:
+- The user asks for arithmetic.
+- The user asks you to calculate numbers.
+
+Use web_search when:
+- The user asks for latest information.
+- The user says "today".
+- The user says "current".
+- The user says "recent".
+- The user asks for news.
+- The user asks for live information.
+- The answer depends on information that may have changed.
+
+Use knowledge_base_search when:
+- The user explicitly mentions their uploaded PDF.
+- The user says "my PDF".
+- The user says "uploaded PDF".
+- The user says "uploaded document".
+- The user says "uploaded file".
+- The user says "knowledge base".
+- The user asks "according to my document".
+- The user asks what information exists inside the uploaded document.
+
+Do NOT use knowledge_base_search merely because a PDF happens
+to be uploaded.
+
+For general knowledge questions that do not require current
+information, answer directly without using a tool.
+
+
+RAG RULES
+
+When knowledge_base_search returns multiple sources:
+
+- Read all returned sources.
+- Synthesize the evidence into one answer.
+- Do not simply list or copy the retrieved chunks.
+- Do not reproduce entire chunks.
+- Use the retrieved information as the basis for the answer.
+
+The retrieval system may provide:
+- hybrid relevance
+- semantic relevance
+- BM25 scores
+- match type
+
+These values are retrieval ranking signals.
+They are NOT probabilities and are NOT calibrated confidence scores.
+
+The backend controls how many RAG chunks are retrieved.
+Do not attempt to choose top_k.
+
+If the user makes an obvious typo such as:
+"reag", "ragg", or similar,
+and the document context clearly indicates they mean "RAG",
+interpret the intended term appropriately.
+
+
+WEB SEARCH RULES
+
+When using web_search:
+
+- Use a concise search query.
+- Request at most 3 results.
+- Summarize the useful information.
+- Do not reproduce entire search snippets.
+- Do not unnecessarily repeat the same web search.
+- Prefer one search unless another search is genuinely required.
+
+
+RESPONSE STYLE
+
+Keep responses concise and useful.
+
+For ordinary questions:
+- Prefer a short direct answer.
+
+For web-search questions:
+- Summarize the important findings.
+- Prefer approximately 200 words or fewer unless the user
+  explicitly requests more detail.
+
+For document questions:
+- Synthesize the retrieved evidence.
+- Do not repeat full retrieved chunks.
+
+Do not claim that a tool was used unless it was actually used.
+"""
+
+
+# ============================================================
+# BUILD CHAT HISTORY
 # ============================================================
 
 def build_messages(
-    chat_history: list,
+    chat_history,
     active_document=None
 ):
+    """
+    Convert Streamlit chat history into Groq messages.
+
+    Historical tool metadata is converted into plain text so
+    the model can answer follow-up questions such as:
+    "Which tool did you use?"
+
+    active_document may be passed by app.py.
+    If app.py does not pass it, fall back to the RAG module.
+    """
 
     messages = [
         {
-            "role":
-                "system",
-
-            "content":
-                SYSTEM_PROMPT
+            "role": "system",
+            "content": SYSTEM_PROMPT
         }
     ]
 
 
-    # ========================================================
-    # DOCUMENT STATE
-    # ========================================================
+    # --------------------------------------------------------
+    # ACTIVE DOCUMENT STATUS
+    # --------------------------------------------------------
+
+    if not active_document:
+
+        try:
+            active_document = (
+                get_active_document()
+            )
+
+        except Exception:
+            active_document = None
+
 
     if active_document:
 
         messages.append(
             {
-                "role":
-                    "system",
-
-                "content":
-                    (
-                        "A PDF knowledge base is "
-                        "currently available.\n\n"
-                        f"Active document: "
-                        f"{active_document}\n\n"
-                        "Do not automatically search it. "
-                        "Use knowledge_base_search only "
-                        "when the user's request requires "
-                        "information from the document."
-                    )
+                "role": "system",
+                "content": (
+                    "A PDF knowledge base is currently "
+                    f"active: {active_document}. "
+                    "Do not search it unless the user's "
+                    "request explicitly refers to the "
+                    "uploaded document or knowledge base."
+                )
             }
         )
 
@@ -511,28 +383,24 @@ def build_messages(
 
         messages.append(
             {
-                "role":
-                    "system",
-
-                "content":
-                    (
-                        "There is currently no "
-                        "active uploaded PDF."
-                    )
+                "role": "system",
+                "content": (
+                    "There is currently no active "
+                    "uploaded PDF knowledge base."
+                )
             }
         )
 
 
-    # ========================================================
-    # CONVERSATION
-    # ========================================================
+    # --------------------------------------------------------
+    # CONVERSATION HISTORY
+    # --------------------------------------------------------
 
     for message in chat_history:
 
         role = message.get(
             "role"
         )
-
 
         content = message.get(
             "content",
@@ -544,37 +412,39 @@ def build_messages(
             "user",
             "assistant"
         ]:
-
             continue
 
 
-        if not content:
-
-            continue
-
-
-        # ====================================================
-        # USER
-        # ====================================================
+        # ----------------------------------------------------
+        # USER MESSAGE
+        # ----------------------------------------------------
 
         if role == "user":
 
             messages.append(
                 {
-                    "role":
-                        "user",
-
-                    "content":
-                        content
+                    "role": "user",
+                    "content": content
                 }
             )
 
             continue
 
 
-        # ====================================================
-        # ASSISTANT
-        # ====================================================
+        # ----------------------------------------------------
+        # ASSISTANT MESSAGE
+        # ----------------------------------------------------
+
+        assistant_content = (
+            content
+            if content
+            else ""
+        )
+
+
+        # ----------------------------------------------------
+        # HISTORICAL TOOL METADATA
+        # ----------------------------------------------------
 
         tools_used = message.get(
             "tools",
@@ -582,55 +452,52 @@ def build_messages(
         )
 
 
-        tool_history = ""
-
-
         if tools_used:
 
-            lines = []
+            tool_history = [
+                "",
+                "[TOOLS USED FOR THIS RESPONSE]"
+            ]
 
 
-            for tool in tools_used:
+            for tool_event in tools_used:
 
-                tool_name = (
-                    tool.get(
-                        "tool",
-                        "unknown"
+                tool_name = tool_event.get(
+                    "name",
+                    "unknown"
+                )
+
+                arguments = tool_event.get(
+                    "arguments",
+                    {}
+                )
+
+
+                tool_history.append(
+                    f"- Tool: {tool_name}"
+                )
+
+                tool_history.append(
+                    "  Arguments: "
+                    + json.dumps(
+                        arguments,
+                        ensure_ascii=False
                     )
                 )
 
 
-                arguments = (
-                    tool.get(
-                        "arguments",
-                        {}
-                    )
-                )
-
-
-                lines.append(
-                    f"- Tool: {tool_name}\n"
-                    f"  Arguments: {arguments}"
-                )
-
-
-            tool_history = (
-                "\n\n"
-                "[TOOLS USED FOR THIS RESPONSE]\n"
+            assistant_content += (
+                "\n"
                 + "\n".join(
-                    lines
+                    tool_history
                 )
             )
 
 
         messages.append(
             {
-                "role":
-                    "assistant",
-
-                "content":
-                    content
-                    + tool_history
+                "role": "assistant",
+                "content": assistant_content
             }
         )
 
@@ -639,39 +506,145 @@ def build_messages(
 
 
 # ============================================================
-# AGENT LOOP
+# PARSE TOOL ARGUMENTS
+# ============================================================
+
+def parse_tool_arguments(
+    raw_arguments
+):
+    """
+    Convert Groq's JSON argument string into a Python dict.
+    """
+
+    if not raw_arguments:
+        return {}
+
+
+    if isinstance(
+        raw_arguments,
+        dict
+    ):
+        return raw_arguments
+
+
+    try:
+
+        parsed = json.loads(
+            raw_arguments
+        )
+
+
+        if isinstance(
+            parsed,
+            dict
+        ):
+            return parsed
+
+
+        return {}
+
+
+    except Exception:
+
+        return {}
+
+
+# ============================================================
+# EXTRACT RAG SOURCES
+# ============================================================
+
+def extract_sources(
+    tool_name,
+    tool_result
+):
+    """
+    Extract source metadata from the RAG tool so app.py can
+    display the retrieved PDF chunks.
+    """
+
+    if tool_name != "knowledge_base_search":
+        return []
+
+
+    if not isinstance(
+        tool_result,
+        dict
+    ):
+        return []
+
+
+    if not tool_result.get(
+        "success"
+    ):
+        return []
+
+
+    return tool_result.get(
+        "sources",
+        []
+    ) or []
+
+
+# ============================================================
+# ASK LLM
 # ============================================================
 
 def ask_llm(
-    chat_history: list,
+    chat_history,
     active_document=None
 ):
+    """
+    Run the Agentic AI loop.
+
+    Flow:
+
+    User
+      ↓
+    Groq
+      ↓
+    Tool call?
+      ├── Yes → execute tool → return result → Groq
+      └── No  → final answer
+
+    active_document is accepted so this function is compatible
+    with the existing app.py.
+
+    max_tokens is intentionally kept low because the current
+    Groq tier/model has a small output-tokens-per-minute quota.
+    """
+
+
+    # ========================================================
+    # BUILD MESSAGES
+    # ========================================================
 
     messages = build_messages(
-
         chat_history,
-
-        active_document
+        active_document=active_document
     )
 
 
     tool_events = []
 
+    all_sources = []
 
-    # Protect against infinite loops
-    MAX_STEPS = 5
 
+    # ========================================================
+    # AGENT LOOP
+    # ========================================================
 
     for step in range(
-        MAX_STEPS
+        1,
+        MAX_STEPS + 1
     ):
 
         print(
-            "\n===================================="
+            "\n"
+            "===================================="
         )
 
         print(
-            f"🤖 AGENT STEP: {step + 1}"
+            f"🤖 AGENT STEP: {step}"
         )
 
         print(
@@ -679,30 +652,21 @@ def ask_llm(
         )
 
 
-        # ====================================================
-        # MODEL
-        # ====================================================
+        # ----------------------------------------------------
+        # CALL GROQ
+        # ----------------------------------------------------
 
         response = (
             client
             .chat
             .completions
             .create(
-
-                model=
-                    MODEL_NAME,
-
-                messages=
-                    messages,
-
-                tools=
-                    TOOL_DEFINITIONS,
-
-                tool_choice=
-                    "auto",
-
-                temperature=
-                    0.2
+                model=MODEL_NAME,
+                messages=messages,
+                tools=TOOL_DEFINITIONS,
+                tool_choice="auto",
+                temperature=0.2,
+                max_tokens=MAX_OUTPUT_TOKENS
             )
         )
 
@@ -714,11 +678,23 @@ def ask_llm(
         )
 
 
+        tool_calls = (
+            assistant_message.tool_calls
+            or []
+        )
+
+
         # ====================================================
         # FINAL ANSWER
         # ====================================================
 
-        if not assistant_message.tool_calls:
+        if not tool_calls:
+
+            final_content = (
+                assistant_message.content
+                or ""
+            )
+
 
             print(
                 "✅ Agent finished."
@@ -726,33 +702,52 @@ def ask_llm(
 
 
             return {
-                "content":
-                    assistant_message.content
-                    or "",
-
-                "tools":
-                    tool_events
+                "content": final_content,
+                "tools": tool_events,
+                "sources": all_sources
             }
 
 
         # ====================================================
-        # APPEND TOOL REQUEST
+        # TOOL CALL MESSAGE
         # ====================================================
 
         messages.append(
-            assistant_message.model_dump(
-                exclude_none=True
-            )
+            {
+                "role": "assistant",
+                "content": (
+                    assistant_message.content
+                    or ""
+                ),
+                "tool_calls": [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": (
+                                tool_call
+                                .function
+                                .name
+                            ),
+                            "arguments": (
+                                tool_call
+                                .function
+                                .arguments
+                            )
+                        }
+                    }
+                    for tool_call
+                    in tool_calls
+                ]
+            }
         )
 
 
         # ====================================================
-        # EXECUTE REQUESTED TOOLS
+        # EXECUTE EACH TOOL
         # ====================================================
 
-        for tool_call in (
-            assistant_message.tool_calls
-        ):
+        for tool_call in tool_calls:
 
             tool_name = (
                 tool_call
@@ -761,25 +756,52 @@ def ask_llm(
             )
 
 
-            # ================================================
-            # ARGUMENTS
-            # ================================================
-
-            try:
-
-                arguments = json.loads(
+            arguments = (
+                parse_tool_arguments(
                     tool_call
                     .function
                     .arguments
                 )
+            )
 
-            except (
-                json.JSONDecodeError,
-                TypeError
-            ):
 
-                arguments = {}
+            # ------------------------------------------------
+            # WEB SEARCH SAFETY LIMIT
+            # ------------------------------------------------
 
+            if tool_name == "web_search":
+
+                try:
+
+                    requested_results = int(
+                        arguments.get(
+                            "max_results",
+                            3
+                        )
+                    )
+
+                except (
+                    TypeError,
+                    ValueError
+                ):
+
+                    requested_results = 3
+
+
+                arguments[
+                    "max_results"
+                ] = max(
+                    1,
+                    min(
+                        requested_results,
+                        3
+                    )
+                )
+
+
+            # ------------------------------------------------
+            # LOG TOOL CALL
+            # ------------------------------------------------
 
             print(
                 f"🔧 TOOL CALLED: "
@@ -788,79 +810,96 @@ def ask_llm(
 
 
             print(
-                f"📦 ARGUMENTS: "
+                f"Arguments: "
                 f"{arguments}"
             )
 
 
-            # ================================================
-            # EXECUTE
-            # ================================================
+            # ------------------------------------------------
+            # EXECUTE TOOL
+            # ------------------------------------------------
 
-            result = execute_tool(
-
+            tool_result = execute_tool(
                 tool_name,
-
                 arguments
             )
 
 
-            print(
-                "✅ TOOL RESULT RECEIVED"
-            )
+            if isinstance(
+                tool_result,
+                dict
+            ):
+
+                print(
+                    "Tool success: "
+                    f"{tool_result.get('success')}"
+                )
+
+            else:
+
+                print(
+                    "Tool executed."
+                )
 
 
-            # ================================================
-            # SAVE EVENT FOR STREAMLIT
-            # ================================================
+            # ------------------------------------------------
+            # SAVE TOOL EVENT
+            # ------------------------------------------------
 
             tool_events.append(
                 {
-                    "tool":
-                        tool_name,
-
-                    "arguments":
-                        arguments,
-
-                    "result":
-                        result
+                    "name": tool_name,
+                    "arguments": arguments,
+                    "result": tool_result
                 }
             )
 
 
-            # ================================================
-            # RETURN RESULT TO LLM
-            # ================================================
+            # ------------------------------------------------
+            # SAVE RAG SOURCES
+            # ------------------------------------------------
+
+            sources = extract_sources(
+                tool_name,
+                tool_result
+            )
+
+
+            if sources:
+
+                all_sources.extend(
+                    sources
+                )
+
+
+            # ------------------------------------------------
+            # RETURN TOOL RESULT TO GROQ
+            # ------------------------------------------------
 
             messages.append(
                 {
-                    "role":
-                        "tool",
-
-                    "tool_call_id":
-                        tool_call.id,
-
-                    "content":
-                        json.dumps(
-                            result,
-                            default=str
-                        )
+                    "role": "tool",
+                    "tool_call_id": (
+                        tool_call.id
+                    ),
+                    "content": json.dumps(
+                        tool_result,
+                        ensure_ascii=False,
+                        default=str
+                    )
                 }
             )
 
 
     # ========================================================
-    # SAFETY FALLBACK
+    # MAX STEPS REACHED
     # ========================================================
 
     return {
-        "content":
-            (
-                "I reached the maximum number "
-                "of agent steps before completing "
-                "the request."
-            ),
-
-        "tools":
-            tool_events
+        "content": (
+            "I reached the maximum number of "
+            "agent steps before completing the request."
+        ),
+        "tools": tool_events,
+        "sources": all_sources
     }
